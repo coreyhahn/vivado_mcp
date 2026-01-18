@@ -1,4 +1,51 @@
-"""Vivado TCL session manager - maintains persistent Vivado process using pexpect."""
+"""
+Vivado TCL Session Manager - Maintains a persistent Vivado process using pexpect.
+
+This module provides the core Vivado interaction layer for the MCP server.
+It manages a persistent Vivado TCL session, avoiding the ~30 second startup
+overhead that would occur if Vivado were launched for each command.
+
+Architecture:
+    The VivadoSession class spawns Vivado in TCL mode (-mode tcl) using pexpect.
+    Commands are sent via sendline() and output is captured by waiting for the
+    Vivado prompt (Vivado%). The session stays alive between commands, maintaining
+    state (open projects, synthesized designs, etc.).
+
+Key Design Decisions:
+    1. Singleton Pattern: A global _session instance is used to ensure only one
+       Vivado process runs at a time. Use get_session() to access it.
+
+    2. Thread Safety: A threading lock protects command execution to prevent
+       interleaved commands if multiple async tasks try to use Vivado.
+
+    3. Prompt-Based Parsing: We wait for "Vivado%" prompt to know when a command
+       completes. Output between command send and prompt is captured.
+
+    4. Error Detection: Success/failure is determined by checking for error
+       keywords in the output (ERROR:, invalid command, etc.).
+
+    5. Statistics Tracking: Command count, timing, and error counts are tracked
+       for debugging and performance analysis.
+
+Usage:
+    from vivado_session import get_session
+
+    session = get_session()
+    session.start()  # Launch Vivado
+
+    result = session.run_tcl("open_project /path/to/project.xpr")
+    if result.success:
+        print(f"Project opened in {result.elapsed_ms}ms")
+
+    session.stop()  # Clean shutdown
+
+Dependencies:
+    - pexpect: For spawning and interacting with Vivado process
+    - Vivado: Must be installed and in PATH (or specify path explicitly)
+
+Author: Created with Claude (Anthropic)
+License: MIT
+"""
 
 import pexpect
 import time
@@ -9,9 +56,32 @@ from datetime import datetime
 import threading
 
 
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
+
 @dataclass
 class CommandResult:
-    """Result from a Vivado TCL command."""
+    """
+    Result from executing a Vivado TCL command.
+
+    This dataclass encapsulates all information about a command execution,
+    making it easy to check success, access output, and measure performance.
+
+    Attributes:
+        command: The TCL command that was executed
+        output: The captured output from Vivado (excluding prompts)
+        return_value: "0" for success, "1" for failure (string for JSON compat)
+        success: Boolean indicating if the command succeeded
+        elapsed_ms: Time taken to execute the command in milliseconds
+        timestamp: ISO format timestamp of when the command completed
+
+    Example:
+        result = session.run_tcl("get_property PART [current_project]")
+        if result.success:
+            print(f"Target part: {result.output}")
+            print(f"Took {result.elapsed_ms:.1f}ms")
+    """
     command: str
     output: str
     return_value: str
@@ -20,36 +90,96 @@ class CommandResult:
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
 
+# =============================================================================
+# VIVADO SESSION CLASS
+# =============================================================================
+
 class VivadoSession:
     """
     Manages a persistent Vivado TCL session using pexpect.
 
     Vivado is started once and kept running. Commands are sent and output
-    is captured using pexpect's expect/sendline interface.
+    is captured using pexpect's expect/sendline interface. This avoids the
+    ~30 second startup time that would be incurred for each command.
+
+    The session maintains state between commands, so you can open a project,
+    run synthesis, and then query results - all using the same Vivado instance.
+
+    Attributes:
+        vivado_path: Path to the Vivado executable
+        timeout: Maximum time to wait for command completion (seconds)
+        child: The pexpect spawn object (Vivado process)
+        is_running: Whether Vivado is currently running
+        current_project: Path to currently open project (if any)
+        stats: Dictionary of session statistics
+
+    Thread Safety:
+        A lock (_lock) protects command execution. Multiple threads can
+        safely call run_tcl(), though commands will be serialized.
+
+    Example:
+        with VivadoSession() as session:
+            session.run_tcl("open_project /path/to/project.xpr")
+            result = session.run_tcl("report_timing_summary -return_string")
+            print(result.output)
+        # Vivado is automatically stopped when exiting the context
     """
 
-    # Unique marker to detect end of command output (use something that won't appear in normal output)
+    # Unique marker that won't appear in normal Vivado output
+    # Used internally for sentinel-based parsing (not currently used but reserved)
     SENTINEL = "XYZZY_MCP_9f8e7d6c_DONE"
 
     def __init__(self, vivado_path: str = "vivado", timeout: float = 300.0):
+        """
+        Initialize the Vivado session manager.
+
+        Args:
+            vivado_path: Path to Vivado executable. Defaults to "vivado" which
+                        assumes it's in the system PATH. Can be an absolute path
+                        like "/tools/Xilinx/Vivado/2023.2/bin/vivado".
+            timeout: Maximum time in seconds to wait for any command to complete.
+                    Defaults to 300s (5 minutes) to handle long operations like
+                    synthesis and implementation.
+        """
         self.vivado_path = vivado_path
         self.timeout = timeout
         self.child: Optional[pexpect.spawn] = None
         self.is_running = False
         self.current_project: Optional[str] = None
+
+        # Thread lock for command execution
+        # Ensures only one command runs at a time even with async callers
         self._lock = threading.Lock()
 
-        # Statistics
+        # Statistics tracking for debugging and performance analysis
         self.stats = {
-            "session_start": None,
-            "commands_run": 0,
-            "total_command_time_ms": 0,
-            "errors": 0,
-            "command_history": []
+            "session_start": None,       # ISO timestamp when session started
+            "commands_run": 0,           # Total commands executed
+            "total_command_time_ms": 0,  # Sum of all command times
+            "errors": 0,                 # Count of failed commands
+            "command_history": []        # Last 100 commands (for debugging)
         }
 
     def start(self) -> CommandResult:
-        """Start the Vivado TCL session."""
+        """
+        Start the Vivado TCL session.
+
+        This spawns a new Vivado process in TCL mode with:
+        - No journal file (-nojournal): Avoids cluttering directory
+        - No log file (-nolog): Output goes to pexpect instead
+
+        The function waits for Vivado's startup banner ("Start of session")
+        and then confirms readiness by waiting for the "Vivado%" prompt.
+
+        Returns:
+            CommandResult with success=True if Vivado started successfully,
+            or success=False with error message if startup failed.
+
+        Note:
+            If already running, returns success immediately without restarting.
+            Vivado startup typically takes 20-30 seconds.
+        """
+        # Don't restart if already running
         if self.is_running:
             return CommandResult(
                 command="start",
@@ -62,30 +192,36 @@ class VivadoSession:
         start_time = time.time()
 
         try:
-            # Start Vivado with pexpect
+            # Spawn Vivado in TCL mode
+            # -mode tcl: Interactive TCL shell (no GUI)
+            # -nojournal: Don't create vivado.jou files
+            # -nolog: Don't create vivado.log files
             self.child = pexpect.spawn(
                 f'{self.vivado_path} -mode tcl -nojournal -nolog',
                 encoding='utf-8',
                 timeout=self.timeout,
-                echo=False  # Don't echo commands back
+                echo=False  # Don't echo commands back to us
             )
 
-            # Wait for Vivado to start (look for startup banner)
+            # Wait for Vivado to display its startup banner
+            # This indicates Vivado has loaded and is ready to accept commands
             self.child.expect('Start of session', timeout=120)
 
-            # Give it a moment to fully initialize
+            # Brief pause to let Vivado fully initialize
             time.sleep(1)
 
-            # Drain any remaining startup output
+            # Drain any remaining startup output to clear the buffer
             try:
                 self.child.read_nonblocking(size=100000, timeout=1)
             except (pexpect.TIMEOUT, pexpect.EOF):
-                pass
+                pass  # Expected - no more data to read
 
-            # Wait for prompt to confirm ready
-            self.child.sendline("")  # Empty command to get prompt
+            # Send empty command to confirm we get a prompt back
+            # This validates that Vivado is responsive
+            self.child.sendline("")
             self.child.expect('Vivado%', timeout=10)
 
+            # Mark session as running and record start time
             self.is_running = True
             self.stats["session_start"] = datetime.now().isoformat()
 
@@ -100,6 +236,7 @@ class VivadoSession:
             )
 
         except pexpect.TIMEOUT:
+            # Vivado didn't respond in time
             self.is_running = False
             elapsed = (time.time() - start_time) * 1000
             return CommandResult(
@@ -110,6 +247,7 @@ class VivadoSession:
                 elapsed_ms=elapsed
             )
         except Exception as e:
+            # Other errors (file not found, permissions, etc.)
             self.is_running = False
             elapsed = (time.time() - start_time) * 1000
             return CommandResult(
@@ -124,12 +262,39 @@ class VivadoSession:
         """
         Execute a TCL command and return the result.
 
+        This is the primary interface for interacting with Vivado. The command
+        is sent to the Vivado TCL shell, and output is captured by waiting for
+        the next "Vivado%" prompt.
+
         Args:
-            command: TCL command to execute
+            command: TCL command to execute. Can be any valid Vivado TCL command.
+                    Examples:
+                    - "open_project /path/to/project.xpr"
+                    - "report_timing_summary -return_string"
+                    - "get_property PART [current_project]"
 
         Returns:
-            CommandResult with output and status
+            CommandResult containing:
+            - output: The command's output (stdout from Vivado)
+            - success: True if no error keywords were found in output
+            - elapsed_ms: Execution time in milliseconds
+
+        Thread Safety:
+            This method is thread-safe. A lock ensures only one command
+            executes at a time.
+
+        Output Parsing:
+            The raw pexpect output includes the echoed command and prompts.
+            This method strips those to return only the meaningful output.
+
+        Error Detection:
+            Success is determined by checking for error keywords in output:
+            - "error:" - Vivado error messages
+            - "invalid command" - TCL syntax errors
+            - "can't read" - Variable/file access errors
+            - "wrong # args" - Argument count errors
         """
+        # Check session is running
         if not self.is_running:
             return CommandResult(
                 command=command,
@@ -139,47 +304,52 @@ class VivadoSession:
                 elapsed_ms=0
             )
 
+        # Serialize command execution with a lock
         with self._lock:
             start_time = time.time()
 
             try:
-                # Clear any pending output first
+                # Clear any pending output from previous commands
+                # This ensures we only capture this command's output
                 try:
                     self.child.read_nonblocking(size=100000, timeout=0.1)
                 except (pexpect.TIMEOUT, pexpect.EOF):
-                    pass
+                    pass  # Expected - buffer was empty
 
-                # Send the command
+                # Send the command to Vivado
                 self.child.sendline(command)
 
-                # Wait for Vivado prompt (indicates command completed)
+                # Wait for the Vivado prompt indicating command completion
+                # The prompt appears after Vivado finishes processing
                 self.child.expect('Vivado%', timeout=self.timeout)
 
-                # Get the output (everything before the prompt)
+                # Get everything that was output before the prompt
                 raw_output = self.child.before
 
-                # Parse output: extract content after command echo
+                # Parse the output to extract meaningful content
+                # Raw output includes: command echo, actual output, whitespace
                 lines = raw_output.replace('\r', '').split('\n')
                 clean_lines = []
                 found_command = False
 
-                # Normalize command for matching
+                # Normalize command for matching (handle whitespace differences)
                 cmd_normalized = command.strip()
 
                 for line in lines:
                     stripped = line.strip()
 
-                    # Look for the command echo
+                    # Skip lines until we find the echoed command
+                    # Everything before is leftover from previous operations
                     if not found_command:
                         if cmd_normalized in stripped:
                             found_command = True
                         continue
 
-                    # Skip Vivado prompts
+                    # Skip Vivado prompts in output
                     if stripped == 'Vivado%' or stripped.startswith('Vivado%'):
                         continue
 
-                    # Skip empty lines
+                    # Skip empty lines for cleaner output
                     if not stripped:
                         continue
 
@@ -189,11 +359,12 @@ class VivadoSession:
 
                 elapsed = (time.time() - start_time) * 1000
 
-                # Check for errors in output
+                # Determine success by checking for error indicators
+                # Vivado prefixes errors with specific keywords
                 success = not any(err in output.lower() for err in
                                   ["error:", "invalid command", "can't read", "wrong # args"])
 
-                # Update stats
+                # Update statistics
                 self.stats["commands_run"] += 1
                 self.stats["total_command_time_ms"] += elapsed
                 if not success:
@@ -207,7 +378,7 @@ class VivadoSession:
                     elapsed_ms=elapsed
                 )
 
-                # Keep last 100 commands in history
+                # Add to command history (keep last 100 for debugging)
                 self.stats["command_history"].append({
                     "command": command,
                     "success": success,
@@ -220,6 +391,7 @@ class VivadoSession:
                 return result
 
             except pexpect.TIMEOUT:
+                # Command took too long - might be hung or very long operation
                 elapsed = (time.time() - start_time) * 1000
                 self.stats["errors"] += 1
                 return CommandResult(
@@ -230,6 +402,7 @@ class VivadoSession:
                     elapsed_ms=elapsed
                 )
             except Exception as e:
+                # Unexpected error during command execution
                 elapsed = (time.time() - start_time) * 1000
                 self.stats["errors"] += 1
                 return CommandResult(
@@ -241,7 +414,19 @@ class VivadoSession:
                 )
 
     def stop(self) -> CommandResult:
-        """Stop the Vivado session."""
+        """
+        Stop the Vivado session gracefully.
+
+        Sends the "exit" command to Vivado and waits for the process to
+        terminate. If graceful exit fails, force-closes the process.
+
+        Returns:
+            CommandResult with success=True (stopping always "succeeds"
+            even if we had to force-close)
+
+        Note:
+            Safe to call even if session is not running.
+        """
         if not self.is_running:
             return CommandResult(
                 command="stop",
@@ -254,15 +439,18 @@ class VivadoSession:
         start_time = time.time()
 
         try:
+            # Send exit command for graceful shutdown
             self.child.sendline('exit')
+            # Wait for process to terminate (EOF on stdout)
             self.child.expect(pexpect.EOF, timeout=30)
         except Exception:
-            # Force close if graceful exit fails
+            # If graceful exit fails, force-terminate the process
             try:
                 self.child.close(force=True)
             except:
-                pass
+                pass  # Best effort - process might already be dead
 
+        # Update state
         self.is_running = False
         self.current_project = None
         elapsed = (time.time() - start_time) * 1000
@@ -276,28 +464,82 @@ class VivadoSession:
         )
 
     def get_stats(self) -> dict:
-        """Get session statistics."""
+        """
+        Get session statistics for monitoring and debugging.
+
+        Returns:
+            Dictionary containing:
+            - is_running: Whether session is active
+            - current_project: Path to open project (or None)
+            - session_start: ISO timestamp when session started
+            - commands_run: Total commands executed
+            - total_command_time_ms: Sum of all command times
+            - errors: Count of failed commands
+            - avg_command_time_ms: Average command time (if commands > 0)
+            - command_history: Last 100 commands with timing info
+        """
         stats = self.stats.copy()
         stats["is_running"] = self.is_running
         stats["current_project"] = self.current_project
+
+        # Calculate average command time if we have data
         if self.stats["commands_run"] > 0:
-            stats["avg_command_time_ms"] = self.stats["total_command_time_ms"] / self.stats["commands_run"]
+            stats["avg_command_time_ms"] = (
+                self.stats["total_command_time_ms"] / self.stats["commands_run"]
+            )
+
         return stats
 
     def __enter__(self):
+        """
+        Context manager entry - start the session.
+
+        Example:
+            with VivadoSession() as session:
+                session.run_tcl("...")
+        """
         self.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Context manager exit - stop the session.
+
+        Ensures Vivado is properly shut down even if an exception occurred.
+        """
         self.stop()
 
 
-# Singleton session instance
+# =============================================================================
+# SINGLETON SESSION MANAGEMENT
+# =============================================================================
+
+# Global singleton session instance
+# Using a singleton ensures only one Vivado process runs at a time
 _session: Optional[VivadoSession] = None
 
 
 def get_session() -> VivadoSession:
-    """Get or create the global Vivado session."""
+    """
+    Get or create the global Vivado session.
+
+    This function implements the singleton pattern for VivadoSession.
+    The first call creates a new session; subsequent calls return the
+    same instance.
+
+    Returns:
+        The global VivadoSession instance
+
+    Example:
+        session = get_session()
+        session.start()
+        # ... use session ...
+        session.stop()
+
+    Note:
+        The session is created lazily (on first access) and is NOT
+        automatically started. Call session.start() explicitly.
+    """
     global _session
     if _session is None:
         _session = VivadoSession()
@@ -305,7 +547,18 @@ def get_session() -> VivadoSession:
 
 
 def reset_session():
-    """Reset the global session (stop if running)."""
+    """
+    Reset the global session (stop if running and clear instance).
+
+    Use this to force a fresh Vivado session, for example after
+    recovering from an error or when changing Vivado versions.
+
+    This function:
+    1. Stops the current session if running
+    2. Clears the singleton instance
+
+    The next call to get_session() will create a fresh instance.
+    """
     global _session
     if _session is not None and _session.is_running:
         _session.stop()

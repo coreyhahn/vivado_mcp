@@ -1,5 +1,48 @@
 #!/usr/bin/env python3
-"""Vivado MCP Server - Direct integration with AMD/Xilinx Vivado."""
+"""
+Vivado MCP Server - Direct integration with AMD/Xilinx Vivado.
+
+This module implements a Model Context Protocol (MCP) server that provides
+AI assistants (like Claude) with direct access to AMD/Xilinx Vivado FPGA
+development tools. It enables:
+
+- Session management: Start/stop persistent Vivado TCL sessions
+- Project management: Open/close Vivado projects (.xpr files)
+- Design flow: Run synthesis, implementation, and bitstream generation
+- Reports: Get timing, utilization, and other analysis reports
+- Design queries: Explore hierarchy, ports, nets, and cells
+- Simulation: Control Vivado's behavioral simulator (xsim)
+- Raw TCL: Execute arbitrary TCL commands for advanced operations
+
+Architecture:
+    The server maintains a singleton VivadoSession that keeps Vivado running
+    in TCL mode. Commands are sent via pexpect and results are parsed and
+    returned as structured JSON. This avoids the ~30 second startup time
+    for each Vivado command.
+
+MCP Protocol:
+    The server uses the MCP stdio transport, communicating via stdin/stdout
+    with JSON-RPC messages. Tools are exposed via the @server.list_tools()
+    and @server.call_tool() decorators.
+
+Usage:
+    # Start the server (typically done by Claude Code or another MCP client)
+    python -m vivado_mcp
+
+    # Or via the console script (after pip install)
+    vivado-mcp
+
+Example workflow (from an AI assistant):
+    1. start_session - Start Vivado
+    2. open_project - Open your .xpr file
+    3. run_synthesis - Synthesize the design
+    4. get_timing_summary - Check timing results
+    5. get_utilization - Check resource usage
+    6. stop_session - Clean up when done
+
+Author: Created with Claude (Anthropic)
+License: MIT
+"""
 
 import json
 import os
@@ -13,20 +56,46 @@ from mcp.types import Tool, TextContent
 
 from .vivado_session import get_session, VivadoSession
 
-# Feature requests storage
+
+# =============================================================================
+# CONFIGURATION CONSTANTS
+# =============================================================================
+
+# Feature requests are stored persistently so users can track requested features
 FEATURE_REQUESTS_FILE = Path(__file__).parent / "data" / "feature_requests.json"
 
-# Report management
+# Report management configuration
+# Reports are written to temp files when they exceed inline size limits
 REPORTS_DIR = Path("/tmp/vivado_mcp")
-MAX_RESPONSE_CHARS = 50000  # ~50KB limit for inline responses
-REPORT_CACHE_HOURS = 1  # Clean up reports older than this
 
-# In-memory cache for report metadata
+# Maximum characters to return inline in a response
+# Larger reports should use generate_full_report + read_report_section
+MAX_RESPONSE_CHARS = 50000  # ~50KB limit for inline responses
+
+# How long to keep cached report files before cleanup (in hours)
+REPORT_CACHE_HOURS = 1
+
+# In-memory cache mapping report_id -> metadata (file path, type, etc.)
+# This allows quick lookup of previously generated reports
 _report_cache: dict[str, dict] = {}
 
 
+# =============================================================================
+# FEATURE REQUEST MANAGEMENT
+# =============================================================================
+
 def load_feature_requests() -> list[dict]:
-    """Load feature requests from file."""
+    """
+    Load feature requests from the persistent JSON file.
+
+    Feature requests allow the AI assistant to record when it encounters
+    limitations or wishes it had a tool that doesn't exist. This helps
+    guide future development of the MCP server.
+
+    Returns:
+        List of feature request dictionaries, or empty list if file
+        doesn't exist or can't be parsed.
+    """
     if FEATURE_REQUESTS_FILE.exists():
         try:
             return json.loads(FEATURE_REQUESTS_FILE.read_text())
@@ -36,26 +105,57 @@ def load_feature_requests() -> list[dict]:
 
 
 def save_feature_request(request: dict) -> None:
-    """Save a feature request to the file."""
+    """
+    Save a feature request to the persistent JSON file.
+
+    Args:
+        request: Dictionary containing the feature request with fields:
+            - id: Auto-assigned sequential ID
+            - title: Short description of the feature
+            - description: Detailed explanation of what's needed
+            - use_case: The specific task that prompted this request
+            - priority: low/medium/high
+            - timestamp: ISO format timestamp
+            - status: "pending" (could be updated to "implemented" later)
+    """
     requests = load_feature_requests()
     requests.append(request)
+    # Ensure the data directory exists
     FEATURE_REQUESTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     FEATURE_REQUESTS_FILE.write_text(json.dumps(requests, indent=2))
 
+
+# =============================================================================
+# RESPONSE TRUNCATION
+# =============================================================================
 
 def truncate_response(content: str, max_chars: int = MAX_RESPONSE_CHARS) -> dict:
     """
     Truncate response content if it exceeds max_chars.
 
-    Returns dict with:
-        - content: truncated content (if needed)
-        - truncated: bool indicating if truncation occurred
-        - total_chars: original content length
-        - total_lines: original line count
+    Large Vivado reports can be tens of thousands of lines. Rather than
+    overwhelming the AI context window, we truncate and provide metadata
+    about what was cut. The user can then use generate_full_report to
+    get the complete output to a file.
+
+    Args:
+        content: The full content string to potentially truncate
+        max_chars: Maximum characters to return (default: MAX_RESPONSE_CHARS)
+
+    Returns:
+        Dictionary with:
+            - content: The (possibly truncated) content
+            - truncated: Boolean indicating if truncation occurred
+            - total_chars: Original content length
+            - total_lines: Original line count
+            - returned_chars: Characters in truncated content (if truncated)
+            - returned_lines: Lines in truncated content (if truncated)
+            - truncation_message: Human-readable message about truncation
     """
     total_chars = len(content)
     total_lines = content.count('\n') + 1
 
+    # If content fits, return it unchanged
     if total_chars <= max_chars:
         return {
             "content": content,
@@ -64,10 +164,14 @@ def truncate_response(content: str, max_chars: int = MAX_RESPONSE_CHARS) -> dict
             "total_lines": total_lines
         }
 
-    # Truncate at a line boundary if possible
+    # Truncate to max_chars, but try to end at a line boundary
+    # This makes the output more readable and avoids cutting mid-line
     truncated_content = content[:max_chars]
     last_newline = truncated_content.rfind('\n')
-    if last_newline > max_chars * 0.8:  # Only use newline if we keep >80% of content
+
+    # Only use the newline boundary if we keep >80% of the allowed content
+    # Otherwise we might lose too much useful data
+    if last_newline > max_chars * 0.8:
         truncated_content = truncated_content[:last_newline]
 
     truncated_lines = truncated_content.count('\n') + 1
@@ -83,57 +187,121 @@ def truncate_response(content: str, max_chars: int = MAX_RESPONSE_CHARS) -> dict
     }
 
 
+# =============================================================================
+# REPORT FILE MANAGEMENT
+# =============================================================================
+
 def ensure_reports_dir() -> Path:
-    """Ensure the reports directory exists and clean up old reports."""
+    """
+    Ensure the reports directory exists and clean up old reports.
+
+    This function is called before generating new reports. It:
+    1. Creates the reports directory if it doesn't exist
+    2. Removes any report files older than REPORT_CACHE_HOURS
+    3. Cleans up the in-memory cache for deleted files
+
+    Returns:
+        Path to the reports directory
+    """
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Clean up old reports (older than REPORT_CACHE_HOURS)
+    # Calculate cutoff timestamp for old reports
     cutoff = datetime.now().timestamp() - (REPORT_CACHE_HOURS * 3600)
+
+    # Scan for and remove old report files
     for report_file in REPORTS_DIR.glob("*.txt"):
         try:
             if report_file.stat().st_mtime < cutoff:
                 report_file.unlink()
-                # Also remove from cache if present
+                # Also remove from in-memory cache if present
                 report_id = report_file.stem
                 _report_cache.pop(report_id, None)
         except OSError:
-            pass
+            pass  # Ignore errors during cleanup
 
     return REPORTS_DIR
 
 
 def generate_report_id() -> str:
-    """Generate a unique report ID."""
+    """
+    Generate a unique 8-character report ID.
+
+    Uses UUID4 for uniqueness, truncated to 8 chars for readability.
+    The ID is used to reference reports across tool calls.
+
+    Returns:
+        8-character hexadecimal string (e.g., "a1b2c3d4")
+    """
     return str(uuid.uuid4())[:8]
 
 
 def get_hierarchy_depth(path: str) -> int:
-    """Get the depth of a hierarchical path."""
+    """
+    Get the depth of a hierarchical path.
+
+    Vivado uses "/" to separate hierarchy levels (e.g., "cpu/alu/adder").
+    This function counts the depth to help filter hierarchy queries.
+
+    Args:
+        path: Hierarchical path string
+
+    Returns:
+        Depth as integer (0 for top level, 1 for first level children, etc.)
+    """
     return path.count('/')
 
-# Create the MCP server
+
+# =============================================================================
+# MCP SERVER INSTANCE
+# =============================================================================
+
+# Create the MCP server instance
+# The name "vivado" is used as the server identifier in MCP communications
 server = Server("vivado")
 
 
-# ============================================================================
-# Helper functions to parse Vivado output
-# ============================================================================
+# =============================================================================
+# VIVADO OUTPUT PARSERS
+# =============================================================================
+# These functions parse Vivado's text-based reports into structured data
+# that's easier for AI assistants to work with.
 
 def parse_timing_summary(output: str) -> dict:
-    """Parse timing summary report into structured data."""
+    """
+    Parse a Vivado timing summary report into structured data.
+
+    Timing summary reports contain critical information about whether
+    the design meets timing requirements. Key metrics:
+
+    - WNS (Worst Negative Slack): Most critical setup timing margin
+      Positive = timing met, Negative = timing violation
+    - TNS (Total Negative Slack): Sum of all negative setup slacks
+    - WHS (Worst Hold Slack): Most critical hold timing margin
+    - THS (Total Hold Slack): Sum of all negative hold slacks
+    - WPWS (Worst Pulse Width Slack): For pulse width requirements
+    - TPWS (Total Pulse Width Slack): Sum of pulse width violations
+
+    Args:
+        output: Raw text output from report_timing_summary
+
+    Returns:
+        Dictionary with parsed metrics and "met" boolean indicating
+        if all timing is met (WNS >= 0 and WHS >= 0)
+    """
     result = {
-        "wns": None,  # Worst Negative Slack
-        "tns": None,  # Total Negative Slack
-        "whs": None,  # Worst Hold Slack
-        "ths": None,  # Total Hold Slack
-        "wpws": None, # Worst Pulse Width Slack
-        "tpws": None, # Total Pulse Width Slack
+        "wns": None,   # Worst Negative Slack (setup)
+        "tns": None,   # Total Negative Slack (setup)
+        "whs": None,   # Worst Hold Slack
+        "ths": None,   # Total Hold Slack
+        "wpws": None,  # Worst Pulse Width Slack
+        "tpws": None,  # Total Pulse Width Slack
         "failing_endpoints": 0,
         "met": False,
-        "raw": output
+        "raw": output  # Keep raw output for detailed analysis
     }
 
-    # Parse WNS/TNS
+    # Parse WNS/TNS (setup timing) using regex
+    # Format: "WNS(ns)      :  1.234" or similar
     wns_match = re.search(r"WNS\(ns\)\s*:\s*([-\d.]+)", output)
     tns_match = re.search(r"TNS\(ns\)\s*:\s*([-\d.]+)", output)
     if wns_match:
@@ -141,7 +309,7 @@ def parse_timing_summary(output: str) -> dict:
     if tns_match:
         result["tns"] = float(tns_match.group(1))
 
-    # Parse WHS/THS
+    # Parse WHS/THS (hold timing)
     whs_match = re.search(r"WHS\(ns\)\s*:\s*([-\d.]+)", output)
     ths_match = re.search(r"THS\(ns\)\s*:\s*([-\d.]+)", output)
     if whs_match:
@@ -149,12 +317,12 @@ def parse_timing_summary(output: str) -> dict:
     if ths_match:
         result["ths"] = float(ths_match.group(1))
 
-    # Parse failing endpoints
+    # Parse count of failing endpoints
     fail_match = re.search(r"(\d+)\s+failing\s+endpoint", output, re.IGNORECASE)
     if fail_match:
         result["failing_endpoints"] = int(fail_match.group(1))
 
-    # Check if timing is met
+    # Determine if timing is met: both setup and hold must have non-negative slack
     if result["wns"] is not None and result["whs"] is not None:
         result["met"] = result["wns"] >= 0 and result["whs"] >= 0
 
@@ -162,17 +330,41 @@ def parse_timing_summary(output: str) -> dict:
 
 
 def parse_utilization(output: str) -> dict:
-    """Parse utilization report into structured data."""
+    """
+    Parse a Vivado utilization report into structured data.
+
+    Utilization reports show how much of each FPGA resource type is used.
+    This is critical for understanding if a design will fit and for
+    optimization decisions.
+
+    Resource types tracked:
+    - LUT: Look-Up Tables (combinational logic)
+    - FF: Flip-Flops (registers/sequential logic)
+    - BRAM: Block RAM (on-chip memory)
+    - DSP: DSP slices (multipliers, MACs)
+    - IO: Input/Output pins
+
+    Args:
+        output: Raw text output from report_utilization
+
+    Returns:
+        Dictionary with each resource type containing:
+        - used: Number of resources used
+        - available: Total resources on the device
+        - percent: Utilization percentage
+    """
     result = {
         "lut": {"used": 0, "available": 0, "percent": 0},
         "ff": {"used": 0, "available": 0, "percent": 0},
         "bram": {"used": 0, "available": 0, "percent": 0},
         "dsp": {"used": 0, "available": 0, "percent": 0},
         "io": {"used": 0, "available": 0, "percent": 0},
-        "raw": output
+        "raw": output  # Keep raw output for detailed analysis
     }
 
-    # Parse different resource types
+    # Regex patterns for each resource type
+    # Vivado's table format: "Resource | Used | Fixed | Available | Util%"
+    # Different device families use slightly different names
     patterns = {
         "lut": r"(?:Slice LUTs|CLB LUTs)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)",
         "ff": r"(?:Slice Registers|CLB Registers)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)",
@@ -181,6 +373,7 @@ def parse_utilization(output: str) -> dict:
         "io": r"(?:Bonded IOB|Bonded User I/O)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)"
     }
 
+    # Apply each pattern and extract values
     for resource, pattern in patterns.items():
         match = re.search(pattern, output, re.IGNORECASE)
         if match:
@@ -192,7 +385,21 @@ def parse_utilization(output: str) -> dict:
 
 
 def parse_messages(output: str) -> dict:
-    """Parse Vivado messages into categorized lists."""
+    """
+    Parse Vivado messages into categorized lists.
+
+    Vivado outputs messages with severity prefixes:
+    - ERROR: Design or tool errors that must be fixed
+    - CRITICAL WARNING: Serious issues that may cause problems
+    - WARNING: Potential issues to review
+    - INFO: Informational messages
+
+    Args:
+        output: Raw text output containing Vivado messages
+
+    Returns:
+        Dictionary with lists of messages by category
+    """
     result = {
         "errors": [],
         "critical_warnings": [],
@@ -201,6 +408,7 @@ def parse_messages(output: str) -> dict:
         "raw": output
     }
 
+    # Categorize each line by its severity prefix
     for line in output.split("\n"):
         line = line.strip()
         if re.match(r"ERROR:", line):
@@ -215,15 +423,41 @@ def parse_messages(output: str) -> dict:
     return result
 
 
-# ============================================================================
-# TOOLS
-# ============================================================================
+# =============================================================================
+# TOOL DEFINITIONS
+# =============================================================================
+# MCP tools are the interface exposed to AI assistants. Each tool has:
+# - name: Unique identifier for the tool
+# - description: What the tool does (shown to the AI)
+# - inputSchema: JSON Schema defining the parameters
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    """List all available Vivado tools."""
+    """
+    List all available Vivado tools.
+
+    This function is called by MCP clients to discover available tools.
+    Tools are organized into categories:
+
+    1. Session Management: start_session, stop_session, session_status
+    2. Project Management: open_project, close_project, get_project_info
+    3. Design Flow: run_synthesis, run_implementation, generate_bitstream
+    4. Reports/Analysis: get_timing_summary, get_timing_paths, get_utilization, etc.
+    5. Design Queries: get_design_hierarchy, get_ports, get_nets, get_cells
+    6. Raw TCL: run_tcl for advanced operations
+    7. Simulation: launch_simulation, run_simulation, get_signal_value, etc.
+    8. Feature Requests: request_feature, list_feature_requests
+    9. Report Management: generate_full_report, read_report_section
+
+    Returns:
+        List of Tool objects with name, description, and inputSchema
+    """
     return [
-        # Session management
+        # =====================================================================
+        # SESSION MANAGEMENT TOOLS
+        # =====================================================================
+        # These tools control the Vivado process lifecycle
+
         Tool(
             name="start_session",
             description="Start a persistent Vivado TCL session. Must be called before other commands.",
@@ -257,7 +491,11 @@ async def list_tools() -> list[Tool]:
             }
         ),
 
-        # Project management
+        # =====================================================================
+        # PROJECT MANAGEMENT TOOLS
+        # =====================================================================
+        # These tools work with Vivado project files (.xpr)
+
         Tool(
             name="open_project",
             description="Open a Vivado project (.xpr file)",
@@ -291,7 +529,11 @@ async def list_tools() -> list[Tool]:
             }
         ),
 
-        # Design flow
+        # =====================================================================
+        # DESIGN FLOW TOOLS
+        # =====================================================================
+        # These tools run the major FPGA design flow steps
+
         Tool(
             name="run_synthesis",
             description="Run synthesis on the current project",
@@ -330,7 +572,11 @@ async def list_tools() -> list[Tool]:
             }
         ),
 
-        # Reports and analysis
+        # =====================================================================
+        # REPORTS AND ANALYSIS TOOLS
+        # =====================================================================
+        # These tools generate and parse Vivado's analysis reports
+
         Tool(
             name="get_timing_summary",
             description="Get timing summary (WNS, TNS, WHS, THS) - returns structured data",
@@ -439,7 +685,11 @@ async def list_tools() -> list[Tool]:
             }
         ),
 
-        # Design queries
+        # =====================================================================
+        # DESIGN QUERY TOOLS
+        # =====================================================================
+        # These tools explore the elaborated/synthesized design structure
+
         Tool(
             name="get_design_hierarchy",
             description="Get the design hierarchy (modules and instances)",
@@ -504,7 +754,11 @@ async def list_tools() -> list[Tool]:
             }
         ),
 
-        # Raw TCL
+        # =====================================================================
+        # RAW TCL TOOL
+        # =====================================================================
+        # Escape hatch for advanced operations not covered by specific tools
+
         Tool(
             name="run_tcl",
             description="Execute a raw TCL command in Vivado. Use for advanced operations not covered by other tools.",
@@ -520,7 +774,11 @@ async def list_tools() -> list[Tool]:
             }
         ),
 
-        # Simulation tools
+        # =====================================================================
+        # SIMULATION TOOLS
+        # =====================================================================
+        # These tools control Vivado's integrated simulator (xsim)
+
         Tool(
             name="launch_simulation",
             description="Launch behavioral simulation (xsim). Opens the simulator and loads the design.",
@@ -739,7 +997,11 @@ async def list_tools() -> list[Tool]:
             }
         ),
 
-        # Feature requests
+        # =====================================================================
+        # FEATURE REQUEST TOOLS
+        # =====================================================================
+        # Allow AI assistants to request new features
+
         Tool(
             name="request_feature",
             description="Request a new feature or capability for the Vivado MCP server. Use this when you encounter a limitation or wish you had a tool that doesn't exist.",
@@ -777,7 +1039,11 @@ async def list_tools() -> list[Tool]:
             }
         ),
 
-        # Report file management
+        # =====================================================================
+        # REPORT FILE MANAGEMENT TOOLS
+        # =====================================================================
+        # Handle large reports that exceed inline response limits
+
         Tool(
             name="generate_full_report",
             description="Generate a full Vivado report to a file. Use when inline reports are truncated or you need the complete output.",
@@ -834,13 +1100,45 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+# =============================================================================
+# TOOL IMPLEMENTATION
+# =============================================================================
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    """Handle tool calls."""
+    """
+    Handle tool calls from MCP clients.
+
+    This is the main dispatcher that routes tool calls to their implementations.
+    Each tool returns a list containing a single TextContent with JSON-formatted
+    results.
+
+    Args:
+        name: The tool name being called
+        arguments: Dictionary of arguments passed to the tool
+
+    Returns:
+        List containing one TextContent with JSON response
+
+    Response format:
+        All tools return JSON with at minimum:
+        - success: Boolean indicating if the operation succeeded
+        - Additional fields specific to each tool
+
+        On error:
+        - error: Error message string
+        - success: False
+    """
+    # Get the singleton Vivado session
     session = get_session()
 
-    # Session management
+    # =========================================================================
+    # SESSION MANAGEMENT
+    # =========================================================================
+
     if name == "start_session":
+        # Start Vivado TCL session
+        # This spawns a persistent Vivado process that stays running
         vivado_path = arguments.get("vivado_path", "vivado")
         session.vivado_path = vivado_path
         result = session.start()
@@ -851,6 +1149,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "stop_session":
+        # Stop Vivado session gracefully
         result = session.stop()
         return [TextContent(type="text", text=json.dumps({
             "success": result.success,
@@ -858,19 +1157,29 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "session_status":
+        # Get session statistics (commands run, errors, timing, etc.)
         stats = session.get_stats()
         return [TextContent(type="text", text=json.dumps(stats, indent=2))]
 
-    # Check session is running for remaining commands
+    # =========================================================================
+    # SESSION CHECK
+    # =========================================================================
+    # All remaining commands require an active Vivado session
+
     if not session.is_running:
         return [TextContent(type="text", text=json.dumps({
             "error": "Vivado session not running. Call start_session first.",
             "success": False
         }, indent=2))]
 
-    # Project management
+    # =========================================================================
+    # PROJECT MANAGEMENT
+    # =========================================================================
+
     if name == "open_project":
+        # Open a Vivado project file (.xpr)
         project_path = arguments.get("project_path", "")
+        # Use braces to handle paths with spaces
         result = session.run_tcl(f"open_project {{{project_path}}}")
         if result.success:
             session.current_project = project_path
@@ -881,6 +1190,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "close_project":
+        # Close the current project
         result = session.run_tcl("close_project")
         session.current_project = None
         return [TextContent(type="text", text=json.dumps({
@@ -889,11 +1199,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "get_project_info":
+        # Get various project properties
         commands = [
-            "current_project",
-            "get_property PART [current_project]",
-            "get_property TARGET_LANGUAGE [current_project]",
-            "get_property DIRECTORY [current_project]"
+            "current_project",                                    # Project name
+            "get_property PART [current_project]",               # Target FPGA part
+            "get_property TARGET_LANGUAGE [current_project]",    # Verilog/VHDL
+            "get_property DIRECTORY [current_project]"           # Project directory
         ]
         results = {}
         for cmd in commands:
@@ -901,8 +1212,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             results[cmd] = r.output
         return [TextContent(type="text", text=json.dumps(results, indent=2))]
 
-    # Design flow
+    # =========================================================================
+    # DESIGN FLOW
+    # =========================================================================
+
     elif name == "run_synthesis":
+        # Run synthesis with optional parallel jobs
+        # reset_run clears previous results, launch_runs starts synthesis,
+        # wait_on_run blocks until complete
         jobs = arguments.get("jobs", 4)
         result = session.run_tcl(f"reset_run synth_1; launch_runs synth_1 -jobs {jobs}; wait_on_run synth_1")
         return [TextContent(type="text", text=json.dumps({
@@ -912,6 +1229,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "run_implementation":
+        # Run place and route
         jobs = arguments.get("jobs", 4)
         result = session.run_tcl(f"launch_runs impl_1 -jobs {jobs}; wait_on_run impl_1")
         return [TextContent(type="text", text=json.dumps({
@@ -921,6 +1239,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "generate_bitstream":
+        # Generate bitstream (programming file)
         result = session.run_tcl("launch_runs impl_1 -to_step write_bitstream; wait_on_run impl_1")
         return [TextContent(type="text", text=json.dumps({
             "success": result.success,
@@ -928,126 +1247,29 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "elapsed_ms": result.elapsed_ms
         }, indent=2))]
 
-    # Reports and analysis
+    # =========================================================================
+    # REPORTS AND ANALYSIS
+    # =========================================================================
+
     elif name == "get_timing_summary":
+        # Get timing summary with parsed metrics
         report_type = arguments.get("report_type", "summary")
         detail_level = arguments.get("detail_level", "standard")
 
+        # Run Vivado timing summary report
         result = session.run_tcl("report_timing_summary -no_header -return_string")
+
+        # Parse the raw output into structured data
         parsed = parse_timing_summary(result.output)
         parsed["success"] = result.success
         parsed["elapsed_ms"] = result.elapsed_ms
 
-        # Control output based on detail_level
+        # Control output verbosity based on detail_level
         if detail_level == "summary":
-            # Remove raw output, keep only parsed metrics
+            # Only return parsed metrics, no raw output
             parsed.pop("raw", None)
         elif detail_level == "standard":
-            # Truncate raw output if too large
-            if "raw" in parsed and len(parsed["raw"]) > MAX_RESPONSE_CHARS // 2:
-                truncated = truncate_response(parsed["raw"], MAX_RESPONSE_CHARS // 2)
-                parsed["raw"] = truncated["content"]
-                if truncated["truncated"]:
-                    parsed["raw_truncated"] = True
-                    parsed["raw_total_chars"] = truncated["total_chars"]
-        # detail_level == "full": keep complete raw output (but still apply safety truncation)
-        elif detail_level == "full":
-            if "raw" in parsed:
-                truncated = truncate_response(parsed["raw"], MAX_RESPONSE_CHARS)
-                parsed["raw"] = truncated["content"]
-                if truncated["truncated"]:
-                    parsed["raw_truncated"] = True
-                    parsed["raw_total_chars"] = truncated["total_chars"]
-                    parsed["truncation_message"] = truncated["truncation_message"]
-
-        return [TextContent(type="text", text=json.dumps(parsed, indent=2))]
-
-    elif name == "get_timing_paths":
-        num_paths = arguments.get("num_paths", 10)
-        slack_threshold = arguments.get("slack_threshold", 0)
-        path_type = arguments.get("path_type", "setup")
-        from_pin = arguments.get("from_pin")
-        to_pin = arguments.get("to_pin")
-        through = arguments.get("through")
-        clock = arguments.get("clock")
-
-        delay_type = "max" if path_type == "setup" else "min"
-        cmd = f"report_timing -delay_type {delay_type} -max_paths {num_paths} -slack_lesser_than {slack_threshold}"
-
-        # Add optional filters
-        if from_pin:
-            cmd += f" -from {{{from_pin}}}"
-        if to_pin:
-            cmd += f" -to {{{to_pin}}}"
-        if through:
-            cmd += f" -through {{{through}}}"
-        if clock:
-            cmd += f" -filter {{CLOCK == {clock}}}"
-
-        cmd += " -return_string"
-        result = session.run_tcl(cmd)
-
-        # Apply truncation for large outputs
-        response = {
-            "success": result.success,
-            "elapsed_ms": result.elapsed_ms,
-            "filters_applied": {
-                "path_type": path_type,
-                "num_paths": num_paths,
-                "slack_threshold": slack_threshold
-            }
-        }
-
-        if from_pin:
-            response["filters_applied"]["from_pin"] = from_pin
-        if to_pin:
-            response["filters_applied"]["to_pin"] = to_pin
-        if through:
-            response["filters_applied"]["through"] = through
-        if clock:
-            response["filters_applied"]["clock"] = clock
-
-        if result.success:
-            truncated = truncate_response(result.output, MAX_RESPONSE_CHARS)
-            response["paths"] = truncated["content"]
-            if truncated["truncated"]:
-                response["truncated"] = True
-                response["total_chars"] = truncated["total_chars"]
-                response["truncation_message"] = truncated["truncation_message"]
-        else:
-            response["paths"] = result.output
-
-        return [TextContent(type="text", text=json.dumps(response, indent=2))]
-
-    elif name == "get_utilization":
-        hierarchical = arguments.get("hierarchical", False)
-        detail_level = arguments.get("detail_level", "standard")
-        module_filter = arguments.get("module_filter")
-        threshold_percent = arguments.get("threshold_percent")
-
-        cmd = "report_utilization -return_string"
-        if hierarchical:
-            cmd += " -hierarchical"
-            if module_filter:
-                cmd += f" -hierarchical_pattern {{{module_filter}}}"
-
-        result = session.run_tcl(cmd)
-        parsed = parse_utilization(result.output)
-        parsed["success"] = result.success
-        parsed["elapsed_ms"] = result.elapsed_ms
-
-        # Apply threshold filter if specified
-        if threshold_percent is not None:
-            for resource in ["lut", "ff", "bram", "dsp", "io"]:
-                if resource in parsed and parsed[resource]["percent"] < threshold_percent:
-                    parsed[resource]["below_threshold"] = True
-
-        # Control output based on detail_level
-        if detail_level == "summary":
-            # Remove raw output, keep only parsed metrics
-            parsed.pop("raw", None)
-        elif detail_level == "standard":
-            # Truncate raw output if too large
+            # Truncate raw output if too large (half of max to leave room for other data)
             if "raw" in parsed and len(parsed["raw"]) > MAX_RESPONSE_CHARS // 2:
                 truncated = truncate_response(parsed["raw"], MAX_RESPONSE_CHARS // 2)
                 parsed["raw"] = truncated["content"]
@@ -1066,7 +1288,118 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         return [TextContent(type="text", text=json.dumps(parsed, indent=2))]
 
+    elif name == "get_timing_paths":
+        # Get detailed timing path information
+        # Useful for debugging timing violations
+        num_paths = arguments.get("num_paths", 10)
+        slack_threshold = arguments.get("slack_threshold", 0)  # 0 = failing paths only
+        path_type = arguments.get("path_type", "setup")
+        from_pin = arguments.get("from_pin")
+        to_pin = arguments.get("to_pin")
+        through = arguments.get("through")
+        clock = arguments.get("clock")
+
+        # Build the report_timing command
+        delay_type = "max" if path_type == "setup" else "min"
+        cmd = f"report_timing -delay_type {delay_type} -max_paths {num_paths} -slack_lesser_than {slack_threshold}"
+
+        # Add optional path filters
+        if from_pin:
+            cmd += f" -from {{{from_pin}}}"
+        if to_pin:
+            cmd += f" -to {{{to_pin}}}"
+        if through:
+            cmd += f" -through {{{through}}}"
+        if clock:
+            cmd += f" -filter {{CLOCK == {clock}}}"
+
+        cmd += " -return_string"
+        result = session.run_tcl(cmd)
+
+        # Build response with filter information
+        response = {
+            "success": result.success,
+            "elapsed_ms": result.elapsed_ms,
+            "filters_applied": {
+                "path_type": path_type,
+                "num_paths": num_paths,
+                "slack_threshold": slack_threshold
+            }
+        }
+
+        # Include any filters that were used
+        if from_pin:
+            response["filters_applied"]["from_pin"] = from_pin
+        if to_pin:
+            response["filters_applied"]["to_pin"] = to_pin
+        if through:
+            response["filters_applied"]["through"] = through
+        if clock:
+            response["filters_applied"]["clock"] = clock
+
+        # Handle potentially large output
+        if result.success:
+            truncated = truncate_response(result.output, MAX_RESPONSE_CHARS)
+            response["paths"] = truncated["content"]
+            if truncated["truncated"]:
+                response["truncated"] = True
+                response["total_chars"] = truncated["total_chars"]
+                response["truncation_message"] = truncated["truncation_message"]
+        else:
+            response["paths"] = result.output
+
+        return [TextContent(type="text", text=json.dumps(response, indent=2))]
+
+    elif name == "get_utilization":
+        # Get resource utilization with parsed metrics
+        hierarchical = arguments.get("hierarchical", False)
+        detail_level = arguments.get("detail_level", "standard")
+        module_filter = arguments.get("module_filter")
+        threshold_percent = arguments.get("threshold_percent")
+
+        # Build utilization report command
+        cmd = "report_utilization -return_string"
+        if hierarchical:
+            cmd += " -hierarchical"
+            if module_filter:
+                cmd += f" -hierarchical_pattern {{{module_filter}}}"
+
+        result = session.run_tcl(cmd)
+
+        # Parse into structured data
+        parsed = parse_utilization(result.output)
+        parsed["success"] = result.success
+        parsed["elapsed_ms"] = result.elapsed_ms
+
+        # Apply threshold filter if specified
+        if threshold_percent is not None:
+            for resource in ["lut", "ff", "bram", "dsp", "io"]:
+                if resource in parsed and parsed[resource]["percent"] < threshold_percent:
+                    parsed[resource]["below_threshold"] = True
+
+        # Control output verbosity
+        if detail_level == "summary":
+            parsed.pop("raw", None)
+        elif detail_level == "standard":
+            if "raw" in parsed and len(parsed["raw"]) > MAX_RESPONSE_CHARS // 2:
+                truncated = truncate_response(parsed["raw"], MAX_RESPONSE_CHARS // 2)
+                parsed["raw"] = truncated["content"]
+                if truncated["truncated"]:
+                    parsed["raw_truncated"] = True
+                    parsed["raw_total_chars"] = truncated["total_chars"]
+        elif detail_level == "full":
+            if "raw" in parsed:
+                truncated = truncate_response(parsed["raw"], MAX_RESPONSE_CHARS)
+                parsed["raw"] = truncated["content"]
+                if truncated["truncated"]:
+                    parsed["raw_truncated"] = True
+                    parsed["raw_total_chars"] = truncated["total_chars"]
+                    parsed["truncation_message"] = truncated["truncation_message"]
+
+        return [TextContent(type="text", text=json.dumps(parsed, indent=2))]
+
     elif name == "get_clocks":
+        # Get clock information from the design
         result = session.run_tcl("report_clocks -return_string")
         return [TextContent(type="text", text=json.dumps({
             "success": result.success,
@@ -1075,10 +1408,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "get_messages":
+        # Get Vivado messages filtered by severity
         severity = arguments.get("severity", "all")
-        # Get messages from Vivado's message log
         result = session.run_tcl("get_msg_config -rules")
         parsed = parse_messages(result.output)
+
+        # Apply severity filter
         if severity != "all":
             filtered = {
                 "error": parsed["errors"],
@@ -1089,26 +1424,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         parsed["success"] = result.success
         return [TextContent(type="text", text=json.dumps(parsed, indent=2))]
 
-    # Design queries
+    # =========================================================================
+    # DESIGN QUERIES
+    # =========================================================================
+
     elif name == "get_design_hierarchy":
+        # Get the design hierarchy (instances and modules)
         max_depth = arguments.get("max_depth", 3)
         instance_pattern = arguments.get("instance_pattern", "*")
 
-        # Get hierarchical cells with pattern filter
+        # Get all hierarchical cells matching the pattern
         cmd = f"get_cells -hierarchical {{{instance_pattern}}}"
         result = session.run_tcl(cmd)
 
         if result.success and result.output.strip():
             cells = result.output.strip().split()
 
-            # Filter by depth: count '/' separators
+            # Filter by hierarchy depth (count '/' separators)
             filtered_cells = []
             for cell in cells:
                 depth = get_hierarchy_depth(cell)
                 if depth <= max_depth:
                     filtered_cells.append(cell)
 
-            # Build hierarchical structure
+            # Build a hierarchical structure for easier visualization
             hierarchy = {}
             for cell in sorted(filtered_cells):
                 parts = cell.split('/')
@@ -1118,9 +1457,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         current[part] = {"_children": {}}
                     current = current[part]["_children"]
 
-            # Also get module reference for each cell (limited to avoid large output)
+            # Get module reference for each cell (limited for performance)
             cell_refs = {}
-            sample_cells = filtered_cells[:100]  # Limit for performance
+            sample_cells = filtered_cells[:100]
             for cell in sample_cells:
                 ref_result = session.run_tcl(f"get_property REF_NAME [get_cells {{{cell}}}]")
                 if ref_result.success and ref_result.output.strip():
@@ -1128,7 +1467,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             response = {
                 "success": True,
-                "cells": filtered_cells[:500],  # Limit response size
+                "cells": filtered_cells[:500],  # Limit for response size
                 "cell_count": len(filtered_cells),
                 "cell_modules": cell_refs,
                 "max_depth": max_depth,
@@ -1151,6 +1490,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps(response, indent=2))]
 
     elif name == "get_ports":
+        # Get top-level I/O ports
         result = session.run_tcl("get_ports *")
         return [TextContent(type="text", text=json.dumps({
             "success": result.success,
@@ -1159,8 +1499,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "get_nets":
+        # Search for nets by pattern
         pattern = arguments.get("pattern", "*")
         limit = arguments.get("limit", 100)
+        # Use lrange to limit results
         result = session.run_tcl(f"lrange [get_nets {{{pattern}}}] 0 {limit-1}")
         return [TextContent(type="text", text=json.dumps({
             "success": result.success,
@@ -1169,6 +1511,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "get_cells":
+        # Search for cells/instances by pattern
         pattern = arguments.get("pattern", "*")
         limit = arguments.get("limit", 100)
         result = session.run_tcl(f"lrange [get_cells {{{pattern}}}] 0 {limit-1}")
@@ -1178,8 +1521,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "elapsed_ms": result.elapsed_ms
         }, indent=2))]
 
-    # Raw TCL
+    # =========================================================================
+    # RAW TCL
+    # =========================================================================
+
     elif name == "run_tcl":
+        # Execute arbitrary TCL command (escape hatch for advanced users)
         command = arguments.get("command", "")
         result = session.run_tcl(command)
         return [TextContent(type="text", text=json.dumps({
@@ -1188,15 +1535,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "elapsed_ms": result.elapsed_ms
         }, indent=2))]
 
-    # Simulation tools
+    # =========================================================================
+    # SIMULATION TOOLS
+    # =========================================================================
+
     elif name == "launch_simulation":
+        # Launch Vivado's integrated simulator (xsim)
         mode = arguments.get("mode", "behavioral")
+
+        # Map friendly names to Vivado's mode strings
         mode_map = {
-            "behavioral": "behav",
-            "post_synth_func": "synth -type func",
-            "post_synth_timing": "synth -type timing",
-            "post_impl_func": "impl -type func",
-            "post_impl_timing": "impl -type timing"
+            "behavioral": "behav",                    # RTL simulation
+            "post_synth_func": "synth -type func",   # Post-synthesis functional
+            "post_synth_timing": "synth -type timing", # Post-synthesis with timing
+            "post_impl_func": "impl -type func",     # Post-implementation functional
+            "post_impl_timing": "impl -type timing"  # Post-implementation with timing
         }
         sim_mode = mode_map.get(mode, "behav")
         result = session.run_tcl(f"launch_simulation -mode {sim_mode}")
@@ -1207,8 +1560,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "run_simulation":
+        # Advance simulation time
         time_val = arguments.get("time", "100ns")
         if time_val.lower() == "all":
+            # Run until all events processed (testbench completes)
             result = session.run_tcl("run -all")
         else:
             result = session.run_tcl(f"run {time_val}")
@@ -1219,6 +1574,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "restart_simulation":
+        # Reset simulation to time 0
         result = session.run_tcl("restart")
         return [TextContent(type="text", text=json.dumps({
             "success": result.success,
@@ -1227,6 +1583,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "close_simulation":
+        # Close the simulator
         result = session.run_tcl("close_sim")
         return [TextContent(type="text", text=json.dumps({
             "success": result.success,
@@ -1235,6 +1592,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "get_simulation_time":
+        # Get current simulation time
         result = session.run_tcl("current_time")
         return [TextContent(type="text", text=json.dumps({
             "success": result.success,
@@ -1243,6 +1601,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "get_signal_value":
+        # Get current value of a single signal
         signal = arguments.get("signal", "")
         radix = arguments.get("radix", "hex")
         result = session.run_tcl(f"get_value -radix {radix} {{{signal}}}")
@@ -1255,14 +1614,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "get_signal_values":
+        # Get values of multiple signals matching a pattern
         pattern = arguments.get("pattern", "/*")
         radix = arguments.get("radix", "hex")
-        # Get list of signals matching pattern
+
+        # First get list of signals matching pattern
         signals_result = session.run_tcl(f"get_objects -filter {{TYPE == signal || TYPE == port}} {{{pattern}}}")
         if signals_result.success and signals_result.output.strip():
             signals = signals_result.output.strip().split()
             values = {}
-            for sig in signals[:50]:  # Limit to 50 signals
+            # Limit to 50 signals to avoid overwhelming response
+            for sig in signals[:50]:
                 val_result = session.run_tcl(f"get_value -radix {radix} {{{sig}}}")
                 if val_result.success:
                     values[sig] = val_result.output.strip()
@@ -1279,6 +1641,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "add_signals_to_wave":
+        # Add signals to waveform viewer
         signals = arguments.get("signals", [])
         if isinstance(signals, str):
             signals = [signals]
@@ -1292,6 +1655,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "set_simulation_top":
+        # Set the top-level testbench module
         top_module = arguments.get("top_module", "")
         fileset = arguments.get("fileset", "sim_1")
         result = session.run_tcl(f"set_property top {top_module} [get_filesets {fileset}]")
@@ -1302,9 +1666,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "get_simulation_objects":
+        # List simulation objects (signals, ports, variables) in a scope
         scope = arguments.get("scope", "/")
         obj_filter = arguments.get("filter", "all")
 
+        # Map filter names to Vivado filter expressions
         filter_map = {
             "all": "",
             "signals": "-filter {TYPE == signal}",
@@ -1323,6 +1689,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "get_scopes":
+        # List child scopes (hierarchy levels) in simulation
         parent = arguments.get("parent", "/")
         result = session.run_tcl(f"get_scopes {{{parent}/*}}")
         scopes = result.output.strip().split() if result.success and result.output.strip() else []
@@ -1335,6 +1702,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "step_simulation":
+        # Step simulation by delta cycles
         count = arguments.get("count", 1)
         result = session.run_tcl(f"step {count}")
         return [TextContent(type="text", text=json.dumps({
@@ -1344,12 +1712,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "add_breakpoint":
+        # Add a breakpoint on signal edge or change
         signal = arguments.get("signal", "")
         condition = arguments.get("condition", "change")
+
+        # Map condition names to Vivado flags
         cond_map = {
-            "posedge": "-posedge",
-            "negedge": "-negedge",
-            "change": ""
+            "posedge": "-posedge",  # Rising edge
+            "negedge": "-negedge",  # Falling edge
+            "change": ""           # Any change
         }
         cond_str = cond_map.get(condition, "")
         result = session.run_tcl(f"add_bp {cond_str} {{{signal}}}")
@@ -1362,6 +1733,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "remove_breakpoints":
+        # Remove all breakpoints
         result = session.run_tcl("remove_bps -all")
         return [TextContent(type="text", text=json.dumps({
             "success": result.success,
@@ -1370,6 +1742,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "get_simulation_messages":
+        # Get simulation log messages
         severity = arguments.get("severity", "all")
         if severity == "all":
             result = session.run_tcl("get_msg_config -count")
@@ -1381,8 +1754,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "elapsed_ms": result.elapsed_ms
         }, indent=2))]
 
-    # Feature requests
+    # =========================================================================
+    # FEATURE REQUESTS
+    # =========================================================================
+
     elif name == "request_feature":
+        # Submit a feature request for future development
         title = arguments.get("title", "")
         description = arguments.get("description", "")
         use_case = arguments.get("use_case", "")
@@ -1406,6 +1783,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "list_feature_requests":
+        # List all submitted feature requests
         requests = load_feature_requests()
         return [TextContent(type="text", text=json.dumps({
             "success": True,
@@ -1413,8 +1791,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "requests": requests
         }, indent=2))]
 
-    # Report file management tools
+    # =========================================================================
+    # REPORT FILE MANAGEMENT
+    # =========================================================================
+
     elif name == "generate_full_report":
+        # Generate a complete report to a file (for large reports)
         report_type = arguments.get("report_type", "timing")
         options = arguments.get("options", {})
         output_file = arguments.get("output_file")
@@ -1422,14 +1804,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # Ensure reports directory exists and clean up old files
         ensure_reports_dir()
 
-        # Generate report ID and file path
+        # Generate unique report ID and file path
         report_id = generate_report_id()
         if output_file:
             file_path = Path(output_file)
         else:
             file_path = REPORTS_DIR / f"{report_type}_{report_id}.txt"
 
-        # Build the report command based on type
+        # Map report types to Vivado commands
         report_commands = {
             "timing": "report_timing -max_paths 100",
             "timing_summary": "report_timing_summary",
@@ -1437,28 +1819,28 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "hierarchy": "report_hierarchy",
             "clocks": "report_clocks",
             "power": "report_power",
-            "drc": "report_drc"
+            "drc": "report_drc"  # Design Rule Check
         }
 
         base_cmd = report_commands.get(report_type, f"report_{report_type}")
 
-        # Add options for specific report types
+        # Apply report-specific options
         if report_type == "utilization" and options.get("hierarchical"):
             base_cmd += " -hierarchical"
         if report_type == "timing" and options.get("num_paths"):
             base_cmd = base_cmd.replace("-max_paths 100", f"-max_paths {options['num_paths']}")
 
-        # Use -file option to write directly to file
+        # Write directly to file using Vivado's -file option
         cmd = f"{base_cmd} -file {{{file_path}}}"
         result = session.run_tcl(cmd)
 
         if result.success:
-            # Get file info
             try:
+                # Get file statistics
                 file_stat = file_path.stat()
                 line_count = sum(1 for _ in open(file_path))
 
-                # Store in cache
+                # Cache report metadata for later lookup
                 _report_cache[report_id] = {
                     "file_path": str(file_path),
                     "report_type": report_type,
@@ -1492,18 +1874,19 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
     elif name == "read_report_section":
+        # Read a portion of a previously generated report
         report_id = arguments.get("report_id")
         file_path = arguments.get("file_path")
         start_line = arguments.get("start_line", 1)
         num_lines = arguments.get("num_lines", 100)
         search_pattern = arguments.get("search_pattern")
 
-        # Resolve file path
+        # Resolve file path from report_id if provided
         if report_id:
             if report_id in _report_cache:
                 file_path = _report_cache[report_id]["file_path"]
             else:
-                # Try to find file in reports directory
+                # Try to find file in reports directory by ID
                 possible_files = list(REPORTS_DIR.glob(f"*_{report_id}.txt"))
                 if possible_files:
                     file_path = str(possible_files[0])
@@ -1527,12 +1910,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "error": f"File not found: {file_path}"
                 }, indent=2))]
 
+            # Read all lines from file
             with open(file_path, 'r') as f:
                 all_lines = f.readlines()
 
             total_lines = len(all_lines)
 
-            # Handle search pattern
+            # Handle search pattern - find and return context around match
             if search_pattern:
                 pattern = re.compile(search_pattern, re.IGNORECASE)
                 for i, line in enumerate(all_lines):
@@ -1550,7 +1934,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         "file_path": str(file_path)
                     }, indent=2))]
 
-            # Extract requested lines (1-indexed)
+            # Extract requested line range (1-indexed to 0-indexed)
             start_idx = max(0, start_line - 1)
             end_idx = min(total_lines, start_idx + num_lines)
             selected_lines = all_lines[start_idx:end_idx]
@@ -1573,11 +1957,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "error": f"Error reading file: {e}"
             }, indent=2))]
 
+    # =========================================================================
+    # UNKNOWN TOOL
+    # =========================================================================
+
     return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}, indent=2))]
 
 
+# =============================================================================
+# SERVER ENTRY POINT
+# =============================================================================
+
 async def main():
-    """Run the MCP server."""
+    """
+    Run the MCP server.
+
+    This function starts the MCP server using stdio transport (stdin/stdout).
+    It's designed to be launched by an MCP client like Claude Code.
+
+    The server runs until the client closes the connection or sends an
+    exit signal.
+    """
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
@@ -1586,6 +1986,7 @@ async def main():
         )
 
 
+# Allow running directly with: python server.py
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())

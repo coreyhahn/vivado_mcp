@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vivado-mcp"
+version = "0.1.0"
+description = "MCP server for AMD/Xilinx Vivado FPGA development - enables AI assistants to control Vivado"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Created with Claude", email = "noreply@anthropic.com"}
+]
+keywords = ["mcp", "vivado", "fpga", "xilinx", "amd", "claude", "ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "pexpect>=4.8.0",
+]
+
+[project.scripts]
+vivado-mcp = "vivado_mcp:main"
+
+[project.urls]
+Homepage = "https://github.com/coreyhahn/vivado_mcp"
+Repository = "https://github.com/coreyhahn/vivado_mcp"
+Issues = "https://github.com/coreyhahn/vivado_mcp/issues"
+
+# Since the repo root is the package itself, we map the package name to "."
+[tool.setuptools]
+packages = ["vivado_mcp"]
+package-dir = {"vivado_mcp" = "."}
+
+# Include data files
+[tool.setuptools.package-data]
+vivado_mcp = ["data/*.json"]
