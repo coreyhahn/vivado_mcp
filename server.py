@@ -627,6 +627,15 @@ async def list_tools() -> list[Tool]:
                 "required": []
             }
         ),
+        Tool(
+            name="get_host_status",
+            description="Get status of this Vivado MCP server host including hostname, free memory, and session state. If free memory is below 64GB, use vivado-snoke instead.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ),
 
         # =====================================================================
         # PROJECT MANAGEMENT TOOLS
@@ -1356,6 +1365,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "action": "none",
                 "message": "Session is unresponsive (auto_recover=false)"
             }, indent=2))]
+
+    elif name == "get_host_status":
+        # Get host system status for memory-based server selection
+        import socket
+        import psutil
+
+        hostname = socket.gethostname()
+        mem = psutil.virtual_memory()
+        mem_free_gb = mem.available / (1024 ** 3)
+        mem_total_gb = mem.total / (1024 ** 3)
+
+        # Build suggestion based on free memory (64GB threshold)
+        suggestion = None
+        if mem_free_gb < 64:
+            suggestion = f"Low memory ({mem_free_gb:.1f}GB free). Use vivado-snoke instead."
+
+        return [TextContent(type="text", text=json.dumps({
+            "hostname": hostname,
+            "memory_free_gb": round(mem_free_gb, 1),
+            "memory_total_gb": round(mem_total_gb, 1),
+            "memory_percent_used": mem.percent,
+            "vivado_session_active": session.is_running,
+            "suggestion": suggestion
+        }, indent=2))]
 
     # =========================================================================
     # SESSION CHECK
