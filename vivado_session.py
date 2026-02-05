@@ -90,6 +90,107 @@ class CommandResult:
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
 
+@dataclass
+class ErrorClassification:
+    """
+    Classification of Vivado output for smart error detection.
+
+    Distinguishes between actual errors (TCL syntax/runtime errors, Vivado tool
+    errors) and false positives (error strings that appear in report output like
+    "Timing ERROR: 0" or utilization tables).
+
+    Attributes:
+        is_tcl_error: True if TCL syntax or runtime error detected
+        is_vivado_error: True if Vivado tool error (lines starting with ERROR:)
+        is_report_content: True if output appears to be report/table data
+        error_messages: List of actual error message strings found
+    """
+    is_tcl_error: bool = False
+    is_vivado_error: bool = False
+    is_report_content: bool = False
+    error_messages: list = field(default_factory=list)
+
+    @property
+    def is_actual_failure(self) -> bool:
+        """Return True only if this is a real error, not report content."""
+        return self.is_tcl_error or self.is_vivado_error
+
+
+def classify_output_errors(output: str, command: str) -> ErrorClassification:
+    """
+    Classify errors based on context - distinguishes real failures from
+    report content that happens to contain 'error' strings.
+
+    This function performs smart error detection by:
+    1. Checking for TCL syntax errors at the START of output
+    2. Looking for Vivado errors that START with "ERROR:" (not just contain it)
+    3. Detecting report context (tables, summaries) where "error" is just data
+
+    Args:
+        output: The raw output from Vivado
+        command: The command that was executed (for context)
+
+    Returns:
+        ErrorClassification with details about any errors found
+
+    Example:
+        # This is a real error:
+        # "ERROR: [Synth 8-87] can't read file..."
+
+        # This is NOT an error (report content):
+        # "| Timing ERROR      |  0  |"
+        # "WNS(ns): -0.5  TNS ERROR: 0"
+    """
+    classification = ErrorClassification()
+    lines = output.strip().split('\n')
+
+    # TCL syntax errors - appear at START of output (first few lines)
+    tcl_error_patterns = [
+        r'^invalid command name',
+        r'^wrong # args:',
+        r'^can\'t read ".*": no such variable',
+        r'^expected .* but got',
+        r'^couldn\'t open',
+        r'^no files matched',
+    ]
+
+    for line in lines[:5]:
+        stripped = line.strip()
+        for pattern in tcl_error_patterns:
+            if re.match(pattern, stripped, re.IGNORECASE):
+                classification.is_tcl_error = True
+                classification.error_messages.append(stripped)
+
+    # Vivado errors - lines STARTING with "ERROR:" followed by bracket
+    # Real errors look like: "ERROR: [Synth 8-87] description"
+    # False positives look like: "| Timing ERROR | 0 |" or "error: 0"
+    for line in lines:
+        stripped = line.strip()
+        # Match lines that START with ERROR: followed by a bracket (Vivado error code)
+        if re.match(r'^ERROR:\s*\[', stripped):
+            classification.is_vivado_error = True
+            classification.error_messages.append(stripped)
+
+    # Detect report context - error strings in tables/summaries don't count as errors
+    # These indicators suggest we're looking at report output, not error messages
+    report_indicators = [
+        'WNS(ns)',           # Timing summary
+        'TNS(ns)',           # Timing summary
+        'WHS(ns)',           # Timing summary
+        '+---------',        # Table borders
+        '|------',           # Table borders
+        '| Site Type',       # Utilization report
+        '| Resource',        # Utilization report
+        'Utilization',       # Utilization report header
+        'Design Timing Summary',
+        'Clock Summary',
+    ]
+    if any(ind in output for ind in report_indicators):
+        classification.is_report_content = True
+
+    return classification
+
+
 # =============================================================================
 # VIVADO SESSION CLASS
 # =============================================================================
@@ -258,7 +359,7 @@ class VivadoSession:
                 elapsed_ms=elapsed
             )
 
-    def run_tcl(self, command: str) -> CommandResult:
+    def run_tcl(self, command: str, timeout_override: float = None) -> CommandResult:
         """
         Execute a TCL command and return the result.
 
@@ -272,11 +373,14 @@ class VivadoSession:
                     - "open_project /path/to/project.xpr"
                     - "report_timing_summary -return_string"
                     - "get_property PART [current_project]"
+            timeout_override: Optional timeout in seconds for this specific command.
+                    Useful for long-running operations like synthesis (30+ min)
+                    or implementation (60+ min). If None, uses self.timeout.
 
         Returns:
             CommandResult containing:
             - output: The command's output (stdout from Vivado)
-            - success: True if no error keywords were found in output
+            - success: True if no actual error was detected
             - elapsed_ms: Execution time in milliseconds
 
         Thread Safety:
@@ -288,11 +392,11 @@ class VivadoSession:
             This method strips those to return only the meaningful output.
 
         Error Detection:
-            Success is determined by checking for error keywords in output:
-            - "error:" - Vivado error messages
-            - "invalid command" - TCL syntax errors
-            - "can't read" - Variable/file access errors
-            - "wrong # args" - Argument count errors
+            Uses smart error classification to distinguish real errors from
+            report content that contains error-like strings. Real errors are:
+            - TCL syntax errors at start of output
+            - Vivado errors (lines starting with "ERROR: [code]")
+            Report content like "Timing ERROR: 0" is NOT treated as an error.
         """
         # Check session is running
         if not self.is_running:
@@ -321,7 +425,9 @@ class VivadoSession:
 
                 # Wait for the Vivado prompt indicating command completion
                 # The prompt appears after Vivado finishes processing
-                self.child.expect('Vivado%', timeout=self.timeout)
+                # Use timeout_override if provided (for long operations like synthesis)
+                effective_timeout = timeout_override if timeout_override is not None else self.timeout
+                self.child.expect('Vivado%', timeout=effective_timeout)
 
                 # Get everything that was output before the prompt
                 raw_output = self.child.before
@@ -359,10 +465,10 @@ class VivadoSession:
 
                 elapsed = (time.time() - start_time) * 1000
 
-                # Determine success by checking for error indicators
-                # Vivado prefixes errors with specific keywords
-                success = not any(err in output.lower() for err in
-                                  ["error:", "invalid command", "can't read", "wrong # args"])
+                # Use smart error classification to detect real errors
+                # This avoids false positives from report content like "Timing ERROR: 0"
+                classification = classify_output_errors(output, command)
+                success = not classification.is_actual_failure
 
                 # Update statistics
                 self.stats["commands_run"] += 1
@@ -489,6 +595,60 @@ class VivadoSession:
             )
 
         return stats
+
+    def is_healthy(self) -> bool:
+        """
+        Check if the Vivado session is responsive.
+
+        Sends a simple command to Vivado and checks if it responds within
+        a short timeout. This is useful for detecting hung or dead sessions.
+
+        Returns:
+            True if session responds, False if unresponsive or not running
+
+        Note:
+            This is a quick check (5 second timeout). Use ensure_healthy()
+            if you want to automatically recover from unhealthy sessions.
+        """
+        if not self.is_running or not self.child:
+            return False
+        try:
+            # Send a simple command that produces predictable output
+            self.child.sendline("puts {HEALTH_OK}")
+            self.child.expect("HEALTH_OK", timeout=5)
+            self.child.expect("Vivado%", timeout=5)
+            return True
+        except (pexpect.TIMEOUT, pexpect.EOF):
+            return False
+
+    def ensure_healthy(self) -> CommandResult:
+        """
+        Check session health and restart if needed.
+
+        This is the recommended way to recover from session failures.
+        It checks if the session is responsive and automatically restarts
+        it if not.
+
+        Returns:
+            CommandResult indicating health status or restart result
+
+        Example:
+            result = session.ensure_healthy()
+            if result.success:
+                # Session is ready to use
+                session.run_tcl("...")
+        """
+        if self.is_healthy():
+            return CommandResult(
+                command="health_check",
+                output="Session healthy",
+                return_value="0",
+                success=True,
+                elapsed_ms=0
+            )
+        # Session is unhealthy, try to restart
+        self.stop()
+        return self.start()
 
     def __enter__(self):
         """

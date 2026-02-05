@@ -70,7 +70,7 @@ REPORTS_DIR = Path("/tmp/vivado_mcp")
 
 # Maximum characters to return inline in a response
 # Larger reports should use generate_full_report + read_report_section
-MAX_RESPONSE_CHARS = 50000  # ~50KB limit for inline responses
+MAX_RESPONSE_CHARS = 8000  # ~8KB limit for inline responses
 
 # How long to keep cached report files before cleanup (in hours)
 REPORT_CACHE_HOURS = 1
@@ -184,6 +184,45 @@ def truncate_response(content: str, max_chars: int = MAX_RESPONSE_CHARS) -> dict
         "returned_chars": len(truncated_content),
         "returned_lines": truncated_lines,
         "truncation_message": f"Output truncated ({total_chars:,} chars -> {len(truncated_content):,} chars). Use generate_full_report for complete output."
+    }
+
+
+def verify_run_status(session, run_name: str) -> dict:
+    """
+    Verify actual Vivado run status instead of relying on output parsing.
+
+    Vivado run status is stored as properties on the run object. This function
+    queries those properties directly, which is more reliable than parsing
+    text output that may contain misleading strings.
+
+    Args:
+        session: VivadoSession instance
+        run_name: Name of the run to check (e.g., "synth_1", "impl_1")
+
+    Returns:
+        Dictionary with:
+        - run_name: The run that was checked
+        - status: Vivado's STATUS property (e.g., "synth_design Complete!")
+        - progress: Vivado's PROGRESS property (e.g., "100%")
+        - actually_succeeded: True if run completed successfully
+        - actually_failed: True if run failed
+    """
+    status_result = session.run_tcl(f"get_property STATUS [get_runs {run_name}]")
+    progress_result = session.run_tcl(f"get_property PROGRESS [get_runs {run_name}]")
+
+    status = status_result.output.strip() if status_result.success else "unknown"
+    progress = progress_result.output.strip() if progress_result.success else "unknown"
+
+    # Determine actual success/failure from status string
+    # Successful runs have "Complete!" in status
+    # Failed runs have "ERROR" in status
+    status_lower = status.lower()
+    return {
+        "run_name": run_name,
+        "status": status,
+        "progress": progress,
+        "actually_succeeded": "complete" in status_lower,
+        "actually_failed": "error" in status_lower,
     }
 
 
@@ -423,6 +462,90 @@ def parse_messages(output: str) -> dict:
     return result
 
 
+def parse_timing_paths_summary(output: str, max_paths: int = 5) -> list[dict]:
+    """
+    Extract structured summary of timing paths from report_timing output.
+
+    Parses Vivado's timing path reports to extract key information about
+    each path without the verbose detailed breakdown.
+
+    Args:
+        output: Raw text output from report_timing command
+        max_paths: Maximum number of paths to return (default: 5)
+
+    Returns:
+        List of dictionaries, each containing:
+        - slack: Path slack in ns (negative = failing)
+        - source: Source register/port name
+        - destination: Destination register/port name
+        - source_clock: Source clock domain (if applicable)
+        - dest_clock: Destination clock domain (if applicable)
+        - requirement: Timing requirement in ns
+        - data_path_delay: Data path delay in ns
+        - logic_levels: Number of logic levels
+    """
+    paths = []
+
+    # Split output into individual path blocks
+    # Each path starts with "Slack" line
+    path_blocks = re.split(r'\n(?=Slack\s*(?:\([A-Z]+\))?\s*:)', output)
+
+    for block in path_blocks:
+        if not block.strip() or 'Slack' not in block:
+            continue
+
+        path_info = {}
+
+        # Extract slack value
+        slack_match = re.search(r'Slack\s*(?:\([A-Z]+\))?\s*:\s*([-\d.]+)\s*ns', block)
+        if slack_match:
+            path_info['slack'] = float(slack_match.group(1))
+
+        # Extract source (startpoint)
+        source_match = re.search(r'Source:\s*(\S+)', block)
+        if source_match:
+            path_info['source'] = source_match.group(1)
+
+        # Extract destination (endpoint)
+        dest_match = re.search(r'Destination:\s*(\S+)', block)
+        if dest_match:
+            path_info['destination'] = dest_match.group(1)
+
+        # Extract source clock
+        src_clk_match = re.search(r'Source Clock:\s*(\S+)', block)
+        if src_clk_match:
+            path_info['source_clock'] = src_clk_match.group(1)
+
+        # Extract destination clock
+        dst_clk_match = re.search(r'Destination Clock:\s*(\S+)', block)
+        if dst_clk_match:
+            path_info['dest_clock'] = dst_clk_match.group(1)
+
+        # Extract requirement
+        req_match = re.search(r'Requirement:\s*([-\d.]+)\s*ns', block)
+        if req_match:
+            path_info['requirement'] = float(req_match.group(1))
+
+        # Extract data path delay
+        data_delay_match = re.search(r'Data Path Delay:\s*([-\d.]+)\s*ns', block)
+        if data_delay_match:
+            path_info['data_path_delay'] = float(data_delay_match.group(1))
+
+        # Extract logic levels
+        levels_match = re.search(r'Logic Levels:\s*(\d+)', block)
+        if levels_match:
+            path_info['logic_levels'] = int(levels_match.group(1))
+
+        # Only add if we got meaningful data
+        if 'slack' in path_info:
+            paths.append(path_info)
+
+        if len(paths) >= max_paths:
+            break
+
+    return paths
+
+
 # =============================================================================
 # TOOL DEFINITIONS
 # =============================================================================
@@ -490,6 +613,20 @@ async def list_tools() -> list[Tool]:
                 "required": []
             }
         ),
+        Tool(
+            name="check_session_health",
+            description="Check if Vivado session is responsive and recover if needed. Use this if commands are timing out or behaving unexpectedly.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "auto_recover": {
+                        "type": "boolean",
+                        "description": "Restart session if unhealthy (default: true)"
+                    }
+                },
+                "required": []
+            }
+        ),
 
         # =====================================================================
         # PROJECT MANAGEMENT TOOLS
@@ -543,6 +680,10 @@ async def list_tools() -> list[Tool]:
                     "jobs": {
                         "type": "integer",
                         "description": "Number of parallel jobs (default: 4)"
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default: 1800 = 30 minutes). Increase for large designs."
                     }
                 },
                 "required": []
@@ -557,6 +698,10 @@ async def list_tools() -> list[Tool]:
                     "jobs": {
                         "type": "integer",
                         "description": "Number of parallel jobs (default: 4)"
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default: 3600 = 60 minutes). Increase for large designs."
                     }
                 },
                 "required": []
@@ -579,7 +724,7 @@ async def list_tools() -> list[Tool]:
 
         Tool(
             name="get_timing_summary",
-            description="Get timing summary (WNS, TNS, WHS, THS) - returns structured data",
+            description="Get timing summary (WNS, TNS, WHS, THS). Returns parsed metrics only by default. Use generate_full_report for raw output.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -590,7 +735,7 @@ async def list_tools() -> list[Tool]:
                     "detail_level": {
                         "type": "string",
                         "enum": ["summary", "standard", "full"],
-                        "description": "Detail level: 'summary' (parsed metrics only), 'standard' (default), 'full' (include raw report)"
+                        "description": "Detail level: 'summary' (default, parsed metrics only), 'standard' (+ truncated raw), 'full' (+ complete raw)"
                     }
                 },
                 "required": []
@@ -598,7 +743,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_timing_paths",
-            description="Get detailed timing paths for failing or critical paths",
+            description="Get timing paths for failing or critical paths. Returns structured summary (slack, source, dest, clocks) by default. Use generate_full_report for verbose path details.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -629,6 +774,11 @@ async def list_tools() -> list[Tool]:
                     "clock": {
                         "type": "string",
                         "description": "Filter paths by clock domain name"
+                    },
+                    "detail_level": {
+                        "type": "string",
+                        "enum": ["summary", "standard", "full"],
+                        "description": "Detail level: 'summary' (default, structured only), 'standard' (+ truncated raw), 'full' (+ complete raw)"
                     }
                 },
                 "required": []
@@ -636,7 +786,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_utilization",
-            description="Get resource utilization report - returns structured data",
+            description="Get resource utilization (LUT, FF, BRAM, DSP, IO). Returns parsed metrics only by default. Use generate_full_report for hierarchical details.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -647,7 +797,7 @@ async def list_tools() -> list[Tool]:
                     "detail_level": {
                         "type": "string",
                         "enum": ["summary", "standard", "full"],
-                        "description": "Detail level: 'summary' (parsed only), 'standard' (default, + top consumers), 'full' (+ raw report)"
+                        "description": "Detail level: 'summary' (default, parsed only), 'standard' (+ truncated raw), 'full' (+ complete raw)"
                     },
                     "module_filter": {
                         "type": "string",
@@ -1161,6 +1311,52 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         stats = session.get_stats()
         return [TextContent(type="text", text=json.dumps(stats, indent=2))]
 
+    elif name == "check_session_health":
+        # Check if session is responsive and optionally recover
+        auto_recover = arguments.get("auto_recover", True)
+
+        if not session.is_running:
+            if auto_recover:
+                result = session.start()
+                return [TextContent(type="text", text=json.dumps({
+                    "healthy": result.success,
+                    "action": "started",
+                    "message": "Session was not running, started new session",
+                    "elapsed_ms": result.elapsed_ms
+                }, indent=2))]
+            else:
+                return [TextContent(type="text", text=json.dumps({
+                    "healthy": False,
+                    "action": "none",
+                    "message": "Session not running (auto_recover=false)"
+                }, indent=2))]
+
+        # Session thinks it's running, check if actually responsive
+        is_healthy = session.is_healthy()
+
+        if is_healthy:
+            return [TextContent(type="text", text=json.dumps({
+                "healthy": True,
+                "action": "none",
+                "message": "Session is healthy and responsive"
+            }, indent=2))]
+
+        # Session is unresponsive
+        if auto_recover:
+            result = session.ensure_healthy()
+            return [TextContent(type="text", text=json.dumps({
+                "healthy": result.success,
+                "action": "restarted",
+                "message": "Session was unresponsive, restarted",
+                "elapsed_ms": result.elapsed_ms
+            }, indent=2))]
+        else:
+            return [TextContent(type="text", text=json.dumps({
+                "healthy": False,
+                "action": "none",
+                "message": "Session is unresponsive (auto_recover=false)"
+            }, indent=2))]
+
     # =========================================================================
     # SESSION CHECK
     # =========================================================================
@@ -1221,22 +1417,58 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # reset_run clears previous results, launch_runs starts synthesis,
         # wait_on_run blocks until complete
         jobs = arguments.get("jobs", 4)
-        result = session.run_tcl(f"reset_run synth_1; launch_runs synth_1 -jobs {jobs}; wait_on_run synth_1")
-        return [TextContent(type="text", text=json.dumps({
-            "success": result.success,
+        timeout = arguments.get("timeout", 1800)  # 30 min default
+
+        result = session.run_tcl(
+            f"reset_run synth_1; launch_runs synth_1 -jobs {jobs}; wait_on_run synth_1",
+            timeout_override=timeout
+        )
+
+        # Verify actual run status (more reliable than output parsing)
+        verification = verify_run_status(session, "synth_1")
+        actual_success = verification["actually_succeeded"]
+
+        response = {
+            "success": actual_success,
             "output": result.output,
-            "elapsed_ms": result.elapsed_ms
-        }, indent=2))]
+            "elapsed_ms": result.elapsed_ms,
+            "run_status": verification["status"],
+            "run_progress": verification["progress"],
+        }
+
+        # Note if there was a mismatch between output parsing and actual status
+        if not result.success and actual_success:
+            response["note"] = "Output contained error-like strings but run completed successfully"
+
+        return [TextContent(type="text", text=json.dumps(response, indent=2))]
 
     elif name == "run_implementation":
         # Run place and route
         jobs = arguments.get("jobs", 4)
-        result = session.run_tcl(f"launch_runs impl_1 -jobs {jobs}; wait_on_run impl_1")
-        return [TextContent(type="text", text=json.dumps({
-            "success": result.success,
+        timeout = arguments.get("timeout", 3600)  # 60 min default
+
+        result = session.run_tcl(
+            f"launch_runs impl_1 -jobs {jobs}; wait_on_run impl_1",
+            timeout_override=timeout
+        )
+
+        # Verify actual run status (more reliable than output parsing)
+        verification = verify_run_status(session, "impl_1")
+        actual_success = verification["actually_succeeded"]
+
+        response = {
+            "success": actual_success,
             "output": result.output,
-            "elapsed_ms": result.elapsed_ms
-        }, indent=2))]
+            "elapsed_ms": result.elapsed_ms,
+            "run_status": verification["status"],
+            "run_progress": verification["progress"],
+        }
+
+        # Note if there was a mismatch between output parsing and actual status
+        if not result.success and actual_success:
+            response["note"] = "Output contained error-like strings but run completed successfully"
+
+        return [TextContent(type="text", text=json.dumps(response, indent=2))]
 
     elif name == "generate_bitstream":
         # Generate bitstream (programming file)
@@ -1254,7 +1486,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     elif name == "get_timing_summary":
         # Get timing summary with parsed metrics
         report_type = arguments.get("report_type", "summary")
-        detail_level = arguments.get("detail_level", "standard")
+        detail_level = arguments.get("detail_level", "summary")
 
         # Run Vivado timing summary report
         result = session.run_tcl("report_timing_summary -no_header -return_string")
@@ -1298,6 +1530,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         to_pin = arguments.get("to_pin")
         through = arguments.get("through")
         clock = arguments.get("clock")
+        detail_level = arguments.get("detail_level", "summary")
 
         # Build the report_timing command
         delay_type = "max" if path_type == "setup" else "min"
@@ -1337,23 +1570,40 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if clock:
             response["filters_applied"]["clock"] = clock
 
-        # Handle potentially large output
+        # Handle output based on detail level
         if result.success:
-            truncated = truncate_response(result.output, MAX_RESPONSE_CHARS)
-            response["paths"] = truncated["content"]
-            if truncated["truncated"]:
-                response["truncated"] = True
-                response["total_chars"] = truncated["total_chars"]
-                response["truncation_message"] = truncated["truncation_message"]
+            # Always parse paths into structured format
+            parsed_paths = parse_timing_paths_summary(result.output, max_paths=num_paths)
+            response["paths"] = parsed_paths
+            response["path_count"] = len(parsed_paths)
+
+            if detail_level == "summary":
+                # Only return structured data, no raw output
+                pass
+            elif detail_level == "standard":
+                # Include truncated raw for reference
+                truncated = truncate_response(result.output, MAX_RESPONSE_CHARS // 2)
+                response["raw"] = truncated["content"]
+                if truncated["truncated"]:
+                    response["raw_truncated"] = True
+                    response["raw_total_chars"] = truncated["total_chars"]
+            elif detail_level == "full":
+                # Include complete raw output
+                truncated = truncate_response(result.output, MAX_RESPONSE_CHARS)
+                response["raw"] = truncated["content"]
+                if truncated["truncated"]:
+                    response["raw_truncated"] = True
+                    response["raw_total_chars"] = truncated["total_chars"]
+                    response["truncation_message"] = truncated["truncation_message"]
         else:
-            response["paths"] = result.output
+            response["error"] = result.output
 
         return [TextContent(type="text", text=json.dumps(response, indent=2))]
 
     elif name == "get_utilization":
         # Get resource utilization with parsed metrics
         hierarchical = arguments.get("hierarchical", False)
-        detail_level = arguments.get("detail_level", "standard")
+        detail_level = arguments.get("detail_level", "summary")
         module_filter = arguments.get("module_filter")
         threshold_percent = arguments.get("threshold_percent")
 
