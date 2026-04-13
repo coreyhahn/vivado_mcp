@@ -12,11 +12,19 @@ A Model Context Protocol (MCP) server that enables AI assistants like Claude to 
 - **Simulation**: Control Vivado's integrated simulator (xsim)
 - **Raw TCL**: Execute arbitrary Vivado TCL commands for advanced operations
 
+## Platform Support
+
+| Platform | Status |
+|----------|--------|
+| Linux / macOS | ✅ Fully supported |
+| Windows 10/11 | ✅ Fully supported (requires `pywinpty`) |
+
 ## Requirements
 
 - Python 3.10+
 - AMD/Xilinx Vivado installed (tested with 2023.2+)
 - Vivado must be in your PATH, or specify the full path when starting a session
+- **Windows only**: `pywinpty` — install with `pip install pywinpty`
 
 ## Installation
 
@@ -28,9 +36,17 @@ cd vivado_mcp
 pip install -e .
 ```
 
+**Windows only** — install the ConPTY dependency:
+
+```bash
+pip install pywinpty
+```
+
 ### Configure Claude Code
 
-Add to your Claude Code MCP configuration (`~/.claude/claude_desktop_config.json` or project-level `.mcp.json`):
+Add to your Claude Code MCP configuration (`~/.claude/claude_desktop_config.json` or project-level `.mcp.json`).
+
+**Linux / macOS:**
 
 ```json
 {
@@ -42,7 +58,10 @@ Add to your Claude Code MCP configuration (`~/.claude/claude_desktop_config.json
 }
 ```
 
-Or if you want to specify the Python interpreter:
+**Windows:** Vivado must be launched with its full path since the MCP server
+process may not inherit the system PATH. Pass the path to `vivado.bat` when
+calling `start_session`, or add Vivado's `bin` directory to your user PATH
+before starting Claude Code:
 
 ```json
 {
@@ -55,6 +74,12 @@ Or if you want to specify the Python interpreter:
 }
 ```
 
+Then start the session pointing to the Vivado executable:
+
+```
+start_session → vivado_path: C:\Xilinx\Vivado\2023.2\bin\vivado.bat
+```
+
 ## Usage
 
 Once configured, Claude can interact with Vivado through natural language. Example workflow:
@@ -65,6 +90,11 @@ Once configured, Claude can interact with Vivado through natural language. Examp
 4. **Check timing**: "What's the timing summary? Is timing met?"
 5. **Check utilization**: "Show me the resource utilization"
 6. **Close session**: "Stop the Vivado session"
+
+> **Note for Windows users:** `start_session`, `run_synthesis`, `run_implementation`
+> and `generate_bitstream` run in background threads and return immediately.
+> Use `run_tcl` with `get_property STATUS [get_runs synth_1]` (or `impl_1`) to
+> poll progress while long operations are running.
 
 ## Available Tools
 
@@ -127,7 +157,8 @@ Once configured, Claude can interact with Vivado through natural language. Examp
 │   (AI Client)   │     over stdio        │    Server       │
 └─────────────────┘                       └────────┬────────┘
                                                    │
-                                                   │ pexpect
+                                          Linux:   │ pexpect.spawn (Unix PTY)
+                                          Windows: │ pywinpty ConPTY
                                                    │ (TCL commands)
                                                    ▼
                                           ┌─────────────────┐
@@ -136,7 +167,9 @@ Once configured, Claude can interact with Vivado through natural language. Examp
                                           └─────────────────┘
 ```
 
-The server maintains a persistent Vivado process in TCL mode. Commands are sent via pexpect and output is captured by waiting for the Vivado prompt. This avoids the ~30 second startup overhead that would occur if Vivado were launched for each command.
+The server maintains a persistent Vivado process in TCL mode. Commands are sent via the process interface and output is captured by waiting for the Vivado prompt (`Vivado%`). This avoids the ~30 second startup overhead that would occur if Vivado were launched for each command.
+
+On Linux/macOS `pexpect.spawn` is used. On Windows, Vivado writes its output via `WriteConsole()` which is invisible to standard subprocess pipes; the server instead uses `pywinpty` to create a real Windows ConPTY, which captures all output correctly.
 
 ## Recreating This MCP Server with Claude
 
