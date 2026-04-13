@@ -47,6 +47,7 @@ License: MIT
 import json
 import os
 import re
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -1297,14 +1298,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     if name == "start_session":
         # Start Vivado TCL session
-        # This spawns a persistent Vivado process that stays running
+        # Vivado takes 30-60s to start; we launch it in a background thread
+        # and return immediately so the MCP request doesn't time out.
+        # Use check_session_health or session_status to confirm readiness.
         vivado_path = arguments.get("vivado_path", "vivado")
         session.vivado_path = vivado_path
-        result = session.start()
+
+        if session.is_running:
+            return [TextContent(type="text", text=json.dumps({
+                "success": True,
+                "message": "Session already running",
+                "elapsed_ms": 0
+            }, indent=2))]
+
+        def _start_bg():
+            session.start()
+
+        t = threading.Thread(target=_start_bg, daemon=True)
+        t.start()
+
         return [TextContent(type="text", text=json.dumps({
-            "success": result.success,
-            "message": result.output,
-            "elapsed_ms": result.elapsed_ms
+            "success": True,
+            "message": "Vivado is starting in background (takes ~30-60s). "
+                       "Call check_session_health to confirm it is ready.",
+            "elapsed_ms": 0
         }, indent=2))]
 
     elif name == "stop_session":
@@ -1446,70 +1463,94 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     # =========================================================================
 
     elif name == "run_synthesis":
-        # Run synthesis with optional parallel jobs
-        # reset_run clears previous results, launch_runs starts synthesis,
-        # wait_on_run blocks until complete
+        # Launch synthesis in a background thread to avoid MCP request timeout.
+        # Synthesis can take several minutes; we launch_runs and return immediately.
+        # Use run_tcl("get_property STATUS [get_runs synth_1]") to poll progress.
         jobs = arguments.get("jobs", 4)
         timeout = arguments.get("timeout", 1800)  # 30 min default
 
-        result = session.run_tcl(
-            f"reset_run synth_1; launch_runs synth_1 -jobs {jobs}; wait_on_run synth_1",
-            timeout_override=timeout
+        # Reset and launch (fast, returns immediately)
+        launch_result = session.run_tcl(
+            f"reset_run synth_1; launch_runs synth_1 -jobs {jobs}",
+            timeout_override=60
         )
 
-        # Verify actual run status (more reliable than output parsing)
-        verification = verify_run_status(session, "synth_1")
-        actual_success = verification["actually_succeeded"]
+        if not launch_result.success:
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "output": launch_result.output,
+                "message": "Failed to launch synthesis",
+            }, indent=2))]
 
-        response = {
-            "success": actual_success,
-            "output": result.output,
-            "elapsed_ms": result.elapsed_ms,
-            "run_status": verification["status"],
-            "run_progress": verification["progress"],
-        }
+        # Wait for completion in background thread; session lock will serialize
+        # any status queries that come in while synthesis runs.
+        def _wait_synth():
+            session.run_tcl("wait_on_run synth_1", timeout_override=timeout)
 
-        # Note if there was a mismatch between output parsing and actual status
-        if not result.success and actual_success:
-            response["note"] = "Output contained error-like strings but run completed successfully"
+        threading.Thread(target=_wait_synth, daemon=True).start()
 
-        return [TextContent(type="text", text=json.dumps(response, indent=2))]
+        return [TextContent(type="text", text=json.dumps({
+            "success": True,
+            "message": "Synthesis launched. Poll status with: get_property STATUS [get_runs synth_1]",
+            "output": launch_result.output,
+            "elapsed_ms": launch_result.elapsed_ms,
+        }, indent=2))]
 
     elif name == "run_implementation":
-        # Run place and route
+        # Launch implementation in background — same pattern as run_synthesis.
         jobs = arguments.get("jobs", 4)
         timeout = arguments.get("timeout", 3600)  # 60 min default
 
-        result = session.run_tcl(
-            f"launch_runs impl_1 -jobs {jobs}; wait_on_run impl_1",
-            timeout_override=timeout
+        launch_result = session.run_tcl(
+            f"launch_runs impl_1 -jobs {jobs}",
+            timeout_override=60
         )
 
-        # Verify actual run status (more reliable than output parsing)
-        verification = verify_run_status(session, "impl_1")
-        actual_success = verification["actually_succeeded"]
+        if not launch_result.success:
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "output": launch_result.output,
+                "message": "Failed to launch implementation",
+            }, indent=2))]
 
-        response = {
-            "success": actual_success,
-            "output": result.output,
-            "elapsed_ms": result.elapsed_ms,
-            "run_status": verification["status"],
-            "run_progress": verification["progress"],
-        }
+        def _wait_impl():
+            session.run_tcl("wait_on_run impl_1", timeout_override=timeout)
 
-        # Note if there was a mismatch between output parsing and actual status
-        if not result.success and actual_success:
-            response["note"] = "Output contained error-like strings but run completed successfully"
+        threading.Thread(target=_wait_impl, daemon=True).start()
 
-        return [TextContent(type="text", text=json.dumps(response, indent=2))]
+        return [TextContent(type="text", text=json.dumps({
+            "success": True,
+            "message": "Implementation launched. Poll status with: get_property STATUS [get_runs impl_1]",
+            "output": launch_result.output,
+            "elapsed_ms": launch_result.elapsed_ms,
+        }, indent=2))]
 
     elif name == "generate_bitstream":
-        # Generate bitstream (programming file)
-        result = session.run_tcl("launch_runs impl_1 -to_step write_bitstream; wait_on_run impl_1")
+        # Launch bitstream generation in background — same pattern as synthesis.
+        timeout = arguments.get("timeout", 3600)
+
+        launch_result = session.run_tcl(
+            "launch_runs impl_1 -to_step write_bitstream",
+            timeout_override=60
+        )
+
+        if not launch_result.success:
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "output": launch_result.output,
+                "message": "Failed to launch bitstream generation",
+            }, indent=2))]
+
+        def _wait_bit():
+            session.run_tcl("wait_on_run impl_1", timeout_override=timeout)
+
+        threading.Thread(target=_wait_bit, daemon=True).start()
+
         return [TextContent(type="text", text=json.dumps({
-            "success": result.success,
-            "output": result.output,
-            "elapsed_ms": result.elapsed_ms
+            "success": True,
+            "message": "Bitstream generation launched. Poll status with: get_property STATUS [get_runs impl_1]",
+            "output": launch_result.output,
+            "elapsed_ms": launch_result.elapsed_ms,
         }, indent=2))]
 
     # =========================================================================

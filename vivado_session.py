@@ -47,13 +47,120 @@ Author: Created with Claude (Anthropic)
 License: MIT
 """
 
+import sys
 import pexpect
 import time
 import re
-from typing import Optional
+from typing import Optional, Any
 from dataclasses import dataclass, field
 from datetime import datetime
 import threading
+
+_IS_WINDOWS = sys.platform == 'win32'
+
+
+# =============================================================================
+# WINDOWS-COMPATIBLE PROCESS WRAPPER
+# =============================================================================
+
+if _IS_WINDOWS:
+    import winpty
+
+    class _WindowsVivadoProcess:
+        """
+        Windows-compatible replacement for pexpect.spawn using pywinpty.
+
+        pexpect.spawn requires a Unix PTY. On Windows, Vivado writes its output
+        via WriteConsole() which is invisible to regular subprocess pipes.
+        pywinpty creates a real Windows ConPTY so Vivado's output is captured.
+
+        A background reader thread continuously drains the PTY into a string
+        buffer; expect() polls that buffer looking for the target pattern.
+        """
+
+        def __init__(self, cmd: str, encoding: str = 'utf-8',
+                     codec_errors: str = 'replace', timeout: float = 300):
+            self.encoding = encoding
+            self.codec_errors = codec_errors
+            self.timeout = timeout
+            self.before = ''
+            self._buf = ''
+            self._buf_lock = threading.Lock()
+            self._alive = True
+
+            self._pty = winpty.PtyProcess.spawn(cmd)
+
+            self._reader = threading.Thread(target=self._read_loop, daemon=True)
+            self._reader.start()
+
+        def _read_loop(self):
+            while self._alive:
+                try:
+                    chunk = self._pty.read(4096)
+                    if chunk:
+                        with self._buf_lock:
+                            self._buf += chunk
+                except Exception:
+                    time.sleep(0.05)
+
+        def sendline(self, s: str):
+            self._pty.write(s + '\r\n')
+
+        def expect(self, pattern, timeout=None):
+            """Poll buffer until pattern matches; sets self.before."""
+            if timeout is None:
+                timeout = self.timeout
+
+            if pattern is pexpect.EOF:
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    if not self._pty.isalive():
+                        return 0
+                    time.sleep(0.1)
+                raise pexpect.TIMEOUT(f"Timeout after {timeout}s waiting for EOF")
+
+            pat = re.compile(re.escape(pattern) if isinstance(pattern, str) else pattern)
+            deadline = time.time() + timeout
+
+            while time.time() < deadline:
+                with self._buf_lock:
+                    m = pat.search(self._buf)
+                    if m:
+                        self.before = self._buf[:m.start()]
+                        self._buf = self._buf[m.end():]
+                        return 0
+                time.sleep(0.05)
+
+            with self._buf_lock:
+                tail = self._buf[-400:]
+            raise pexpect.TIMEOUT(
+                f"Timeout after {timeout}s waiting for {pattern!r}. "
+                f"Last output: {tail!r}"
+            )
+
+        def read_nonblocking(self, size: int = 1, timeout: float = 0):
+            deadline = time.time() + timeout
+            while True:
+                with self._buf_lock:
+                    if self._buf:
+                        data = self._buf[:size]
+                        self._buf = self._buf[size:]
+                        return data
+                if time.time() >= deadline:
+                    raise pexpect.TIMEOUT("No data available")
+                time.sleep(0.02)
+
+        def close(self, force: bool = False):
+            self._alive = False
+            try:
+                self._pty.terminate()
+            except Exception:
+                pass
+
+    _SpawnClass = _WindowsVivadoProcess
+
+else:
+    _SpawnClass = pexpect.spawn
 
 
 # =============================================================================
@@ -244,7 +351,7 @@ class VivadoSession:
         """
         self.vivado_path = vivado_path
         self.timeout = timeout
-        self.child: Optional[pexpect.spawn] = None
+        self.child: Optional[Any] = None
         self.is_running = False
         self.current_project: Optional[str] = None
 
@@ -297,30 +404,37 @@ class VivadoSession:
             # -mode tcl: Interactive TCL shell (no GUI)
             # -nojournal: Don't create vivado.jou files
             # -nolog: Don't create vivado.log files
-            self.child = pexpect.spawn(
-                f'{self.vivado_path} -mode tcl -nojournal -nolog',
-                encoding='utf-8',
-                timeout=self.timeout,
-                echo=False  # Don't echo commands back to us
-            )
+            if _IS_WINDOWS:
+                self.child = _SpawnClass(
+                    f'{self.vivado_path} -mode tcl -nojournal -nolog',
+                    encoding='utf-8',
+                    codec_errors='replace',
+                    timeout=self.timeout,
+                )
+            else:
+                self.child = _SpawnClass(
+                    f'{self.vivado_path} -mode tcl -nojournal -nolog',
+                    encoding='utf-8',
+                    timeout=self.timeout,
+                    echo=False,
+                )
 
-            # Wait for Vivado to display its startup banner
-            # This indicates Vivado has loaded and is ready to accept commands
-            self.child.expect('Start of session', timeout=120)
-
-            # Brief pause to let Vivado fully initialize
-            time.sleep(1)
-
-            # Drain any remaining startup output to clear the buffer
-            try:
-                self.child.read_nonblocking(size=100000, timeout=1)
-            except (pexpect.TIMEOUT, pexpect.EOF):
-                pass  # Expected - no more data to read
-
-            # Send empty command to confirm we get a prompt back
-            # This validates that Vivado is responsive
-            self.child.sendline("")
-            self.child.expect('Vivado%', timeout=10)
+            # On Windows, Vivado does not emit "Start of session" — wait directly
+            # for the prompt. On Linux it does, so we wait for whichever comes first.
+            if _IS_WINDOWS:
+                self.child.expect('Vivado%', timeout=120)
+            else:
+                self.child.expect('Start of session', timeout=120)
+                # Brief pause to let Vivado fully initialize
+                time.sleep(1)
+                # Drain any remaining startup output to clear the buffer
+                try:
+                    self.child.read_nonblocking(size=100000, timeout=1)
+                except (pexpect.TIMEOUT, pexpect.EOF, AttributeError, OSError):
+                    pass
+                # Send empty command to confirm we get a prompt back
+                self.child.sendline("")
+                self.child.expect('Vivado%', timeout=10)
 
             # Mark session as running and record start time
             self.is_running = True
@@ -417,8 +531,8 @@ class VivadoSession:
                 # This ensures we only capture this command's output
                 try:
                     self.child.read_nonblocking(size=100000, timeout=0.1)
-                except (pexpect.TIMEOUT, pexpect.EOF):
-                    pass  # Expected - buffer was empty
+                except (pexpect.TIMEOUT, pexpect.EOF, AttributeError, OSError):
+                    pass  # Expected - buffer was empty (AttributeError on Windows/PopenSpawn)
 
                 # Send the command to Vivado
                 self.child.sendline(command)
@@ -553,7 +667,7 @@ class VivadoSession:
             # If graceful exit fails, force-terminate the process
             try:
                 self.child.close(force=True)
-            except:
+            except Exception:
                 pass  # Best effort - process might already be dead
 
         # Update state
