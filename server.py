@@ -339,29 +339,65 @@ def parse_timing_summary(output: str) -> dict:
         "raw": output  # Keep raw output for detailed analysis
     }
 
-    # Parse WNS/TNS (setup timing) using regex
-    # Format: "WNS(ns)      :  1.234" or similar
-    wns_match = re.search(r"WNS\(ns\)\s*:\s*([-\d.]+)", output)
-    tns_match = re.search(r"TNS\(ns\)\s*:\s*([-\d.]+)", output)
-    if wns_match:
-        result["wns"] = float(wns_match.group(1))
-    if tns_match:
-        result["tns"] = float(tns_match.group(1))
+    # Vivado's report_timing_summary prints the metrics in a tabular layout:
+    #
+    #     WNS(ns)   TNS(ns)  TNS Failing Endpoints  TNS Total Endpoints   WHS(ns)   THS(ns)  THS Failing Endpoints  THS Total Endpoints   WPWS(ns)  TPWS(ns)  TPWS Failing Endpoints  TPWS Total Endpoints
+    #     -------   -------  ---------------------  -------------------   -------   -------  ---------------------  -------------------   --------  --------  ----------------------  --------------------
+    #      14.111     0.000                      0                 5688     0.012     0.000                      0                 5688      9.238     0.000                       0                  1752
+    #
+    # We locate the header line, skip the dashed separator, then parse the
+    # first non-empty data row that follows. Twelve tokens are expected:
+    #   WNS, TNS, TNS_fail, TNS_total, WHS, THS, THS_fail, THS_total,
+    #   WPWS, TPWS, TPWS_fail, TPWS_total
+    #
+    # The older "WNS(ns) :  1.234" colon-separated form is still supported as
+    # a fallback for pre-2022 Vivado releases.
+    lines = output.splitlines()
+    header_idx = None
+    for i, line in enumerate(lines):
+        if re.search(r"WNS\(ns\)\s+TNS\(ns\)", line):
+            header_idx = i
+            break
 
-    # Parse WHS/THS (hold timing)
-    whs_match = re.search(r"WHS\(ns\)\s*:\s*([-\d.]+)", output)
-    ths_match = re.search(r"THS\(ns\)\s*:\s*([-\d.]+)", output)
-    if whs_match:
-        result["whs"] = float(whs_match.group(1))
-    if ths_match:
-        result["ths"] = float(ths_match.group(1))
+    parsed_table = False
+    if header_idx is not None:
+        # The data row is the first line after the separator that has numeric tokens
+        for j in range(header_idx + 1, min(header_idx + 6, len(lines))):
+            row = lines[j].strip()
+            # Skip the dashed separator row
+            if not row or set(row) <= set("- "):
+                continue
+            tokens = row.split()
+            # Need at least 8 numeric columns to cover setup + hold
+            if len(tokens) >= 8 and re.match(r"^-?\d+\.?\d*$", tokens[0]):
+                try:
+                    result["wns"] = float(tokens[0])
+                    result["tns"] = float(tokens[1])
+                    setup_failing = int(tokens[2])
+                    result["whs"] = float(tokens[4])
+                    result["ths"] = float(tokens[5])
+                    hold_failing = int(tokens[6])
+                    if len(tokens) >= 12:
+                        result["wpws"] = float(tokens[8])
+                        result["tpws"] = float(tokens[9])
+                    # "failing_endpoints" historically reports setup failures
+                    result["failing_endpoints"] = setup_failing + hold_failing
+                    parsed_table = True
+                    break
+                except (ValueError, IndexError):
+                    continue
 
-    # Parse count of failing endpoints
-    fail_match = re.search(r"(\d+)\s+failing\s+endpoint", output, re.IGNORECASE)
-    if fail_match:
-        result["failing_endpoints"] = int(fail_match.group(1))
+    if not parsed_table:
+        # Legacy colon-separated fallback (pre-2022 Vivado)
+        for key in ("wns", "tns", "whs", "ths", "wpws", "tpws"):
+            m = re.search(rf"{key.upper()}\(ns\)\s*:\s*([-\d.]+)", output)
+            if m:
+                result[key] = float(m.group(1))
+        fail_match = re.search(r"(\d+)\s+failing\s+endpoint", output, re.IGNORECASE)
+        if fail_match:
+            result["failing_endpoints"] = int(fail_match.group(1))
 
-    # Determine if timing is met: both setup and hold must have non-negative slack
+    # Timing is met when both setup and hold slacks are non-negative
     if result["wns"] is not None and result["whs"] is not None:
         result["met"] = result["wns"] >= 0 and result["whs"] >= 0
 
@@ -401,15 +437,20 @@ def parse_utilization(output: str) -> dict:
         "raw": output  # Keep raw output for detailed analysis
     }
 
-    # Regex patterns for each resource type
-    # Vivado's table format: "Resource | Used | Fixed | Available | Util%"
-    # Different device families use slightly different names
+    # Regex patterns for each resource type.
+    #
+    # Vivado's table format varies between releases:
+    #   2021 and earlier:  Used | Fixed |              Available | Util%
+    #   2022 and later:    Used | Fixed | Prohibited | Available | Util%
+    #
+    # The optional (?:\s*\d+\.?\d*\s*\|)? group matches the Prohibited column
+    # when present so the same pattern works across versions.
     patterns = {
-        "lut": r"(?:Slice LUTs|CLB LUTs)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)",
-        "ff": r"(?:Slice Registers|CLB Registers)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)",
-        "bram": r"Block RAM Tile\s*\|\s*(\d+\.?\d*)\s*\|\s*\d+\s*\|\s*(\d+\.?\d*)\s*\|\s*([\d.]+)",
-        "dsp": r"DSPs?\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)",
-        "io": r"(?:Bonded IOB|Bonded User I/O)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)"
+        "lut": r"(?:Slice LUTs|CLB LUTs)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*([\d.]+)",
+        "ff": r"(?:Slice Registers|CLB Registers)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*([\d.]+)",
+        "bram": r"Block RAM Tile\s*\|\s*(\d+\.?\d*)\s*\|\s*\d+\.?\d*\s*\|(?:\s*\d+\.?\d*\s*\|)?\s*(\d+\.?\d*)\s*\|\s*([\d.]+)",
+        "dsp": r"DSPs?\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*([\d.]+)",
+        "io": r"(?:Bonded IOB|Bonded User I/O)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*([\d.]+)"
     }
 
     # Apply each pattern and extract values
