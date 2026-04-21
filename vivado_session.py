@@ -439,23 +439,33 @@ class VivadoSession:
                 self.child.sendline(command)
                 self.child.sendline(f'puts stdout "{marker_end}"; flush stdout')
 
-                # Wait for the end marker to appear. Use timeout_override if
-                # provided (for long operations like synthesis or impl).
+                # Wait for the end marker to appear. We anchor on the marker
+                # followed by a newline so pexpect matches the real stdout
+                # print (marker + \n), not the echoed command line (which has
+                # trailing `"; flush stdout`). Use timeout_override for long
+                # operations like synthesis or impl.
                 effective_timeout = timeout_override if timeout_override is not None else self.timeout
-                self.child.expect(marker_end, timeout=effective_timeout)
+                self.child.expect(re.escape(marker_end) + r"\s*\r?\n", timeout=effective_timeout)
 
                 # child.before now contains everything between the send of the
                 # first marker line and the arrival of the end marker. Extract
                 # the region strictly between the two markers.
                 raw_output = self.child.before
 
-                begin_idx = raw_output.find(marker_begin)
-                if begin_idx != -1:
-                    # Advance past the marker line + its newline
-                    begin_idx += len(marker_begin)
-                    region = raw_output[begin_idx:]
+                # The marker appears twice in the buffer: once as the echoed
+                # `puts stdout "marker"` command, once as the actual stdout
+                # line. We want the region after the SECOND occurrence — the
+                # real print — so find the first, then find the next one
+                # after that.
+                first = raw_output.find(marker_begin)
+                second = raw_output.find(marker_begin, first + 1) if first != -1 else -1
+                if second != -1:
+                    region = raw_output[second + len(marker_begin):]
+                elif first != -1:
+                    # Fallback: only one occurrence seen (shouldn't happen,
+                    # but be safe)
+                    region = raw_output[first + len(marker_begin):]
                 else:
-                    # Marker not found — fall back to full before-buffer
                     region = raw_output
 
                 # Clean up: drop prompt lines, command echoes, blank lines.
