@@ -47,6 +47,7 @@ License: MIT
 import json
 import os
 import re
+import socket
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +56,32 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from .vivado_session import get_session, VivadoSession
+
+
+def _hw_server_reachable(hw_server_url: str, timeout: float = 1.0) -> bool:
+    """Return True if hw_server is accepting TCP connections at the given URL.
+
+    Vivado's `connect_hw_server` blocks for ~30s trying to reach hw_server if
+    nothing is there, and that hang leaks into the persistent Tcl session —
+    subsequent commands queue behind it and appear to hang forever. A cheap
+    Python-side TCP check lets us bail out before the Vivado call and keep
+    the session clean.
+
+    Accepts URLs in either `TCP:host:port` or `host:port` form.
+    """
+    url = hw_server_url[4:] if hw_server_url.startswith("TCP:") else hw_server_url
+    if ":" not in url:
+        return False
+    host, _, port_s = url.rpartition(":")
+    try:
+        port = int(port_s)
+    except ValueError:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, socket.error):
+        return False
 
 
 # =============================================================================
@@ -1581,6 +1608,19 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # server URL. Safe to call multiple times — Vivado is idempotent here.
         hw_url = arguments.get("hw_server_url", "TCP:localhost:3121")
 
+        # Bail fast if hw_server isn't reachable — Vivado's connect_hw_server
+        # will otherwise hang the entire Tcl session for ~30s and poison
+        # subsequent commands.
+        if not _hw_server_reachable(hw_url):
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "hw_server_url": hw_url,
+                "error": "hw_server not reachable",
+                "hint": "Start hw_server (`<vivado>/bin/hw_server &`) and verify a JTAG cable is connected.",
+                "targets_found": 0,
+                "targets": [],
+            }, indent=2))]
+
         # Run open + connect defensively. If hw_manager is already open or the
         # connection already exists, Vivado prints a warning but keeps going.
         # Wrap each step in catch so one prior state doesn't abort the whole
@@ -1641,6 +1681,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         hw_url = arguments.get("hw_server_url", "TCP:localhost:3121")
         target_idx = int(arguments.get("target_index", 0))
         device_idx = int(arguments.get("device_index", 0))
+
+        # Fail fast if hw_server isn't accepting connections. Without this
+        # check Vivado's connect_hw_server hangs the session for ~30s and
+        # poisons follow-up commands.
+        if not _hw_server_reachable(hw_url):
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "bitfile": bitfile,
+                "hw_server_url": hw_url,
+                "error": "hw_server not reachable",
+                "hint": "Start hw_server (`<vivado>/bin/hw_server &`) and verify a JTAG cable is connected.",
+            }, indent=2))]
 
         # Run the whole program flow in one TCL shot so any intermediate
         # failure (cable disconnected, multiple boards, wrong device) is
