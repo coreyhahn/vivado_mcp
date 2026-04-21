@@ -1749,15 +1749,19 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         # After DRC runs, enumerate violation objects. Escape newlines and
         # pipes in messages so we can safely parse on the Python side.
+        # drc_violation objects expose NAME (rule name), SEVERITY, DESCRIPTION
+        # (the free-form text), CHECK (check id), CLASS (ruledeck), and ID.
+        # Older docs and other Vivado object types use MESSAGE, but
+        # drc_violation uses DESCRIPTION.
         probe = (
             f"{drc_cmd}; "
             "set __mcp_rows__ [list]; "
             "foreach __mcp_v__ [get_drc_violations] { "
             "  set __mcp_nm__ [get_property NAME $__mcp_v__]; "
             "  set __mcp_sv__ [get_property SEVERITY $__mcp_v__]; "
-            "  set __mcp_msg__ [get_property MESSAGE $__mcp_v__]; "
+            "  set __mcp_msg__ [get_property DESCRIPTION $__mcp_v__]; "
             "  set __mcp_rule__ \"\"; "
-            "  catch {set __mcp_rule__ [get_property RULE $__mcp_v__]}; "
+            "  catch {set __mcp_rule__ [get_property CLASS $__mcp_v__]}; "
             "  set __mcp_msg__ [string map {\"\\n\" {\\n} | {\\|}} $__mcp_msg__]; "
             "  set __mcp_sv__ [string map {| {\\|}} $__mcp_sv__]; "
             "  lappend __mcp_rows__ \"$__mcp_nm__|$__mcp_sv__|$__mcp_rule__|$__mcp_msg__\" "
