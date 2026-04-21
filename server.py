@@ -725,6 +725,46 @@ async def list_tools() -> list[Tool]:
                 "required": []
             }
         ),
+        Tool(
+            name="launch_run_async",
+            description="Launch a Vivado run (synth_1, impl_1, etc.) without blocking on completion. Use get_run_progress afterwards to poll. Ideal for long impl/bitstream flows that would otherwise freeze the MCP session for 5-15 minutes.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "run": {
+                        "type": "string",
+                        "description": "Run name (e.g. 'synth_1', 'impl_1')"
+                    },
+                    "jobs": {
+                        "type": "integer",
+                        "description": "Parallel jobs (default 4)"
+                    },
+                    "to_step": {
+                        "type": "string",
+                        "description": "Optional stop-step within the run, e.g. 'write_bitstream' for impl_1 to include bitstream generation"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Reset and relaunch if the run is already complete or in progress (default false)"
+                    }
+                },
+                "required": ["run"]
+            }
+        ),
+        Tool(
+            name="get_run_progress",
+            description="Poll a Vivado run for its current STATUS and PROGRESS without blocking. Pair with launch_run_async for non-blocking impl/synth/bitstream flows.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "run": {
+                        "type": "string",
+                        "description": "Run name (e.g. 'synth_1', 'impl_1')"
+                    }
+                },
+                "required": ["run"]
+            }
+        ),
 
         # =====================================================================
         # REPORTS AND ANALYSIS TOOLS
@@ -1510,6 +1550,90 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "success": result.success,
             "output": result.output,
             "elapsed_ms": result.elapsed_ms
+        }, indent=2))]
+
+    elif name == "launch_run_async":
+        # Launch a run without blocking on completion. Vivado's launch_runs
+        # spawns the actual synth/impl as a subprocess and returns quickly
+        # (usually under 5s); the blocking part is the wait_on_run that
+        # run_implementation / run_synthesis normally chain afterwards. By
+        # skipping wait_on_run we hand the session back immediately and let
+        # the caller poll get_run_progress.
+        run_name = arguments.get("run", "").strip()
+        if not run_name:
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "error": "Missing 'run' argument (e.g. 'synth_1', 'impl_1')"
+            }, indent=2))]
+
+        jobs = int(arguments.get("jobs", 4))
+        to_step = arguments.get("to_step", "").strip()
+        force = bool(arguments.get("force", False))
+
+        cmd_parts = []
+        if force:
+            # reset_runs returns an error if the run hasn't been created yet;
+            # wrap in catch so a fresh project doesn't fail this step.
+            cmd_parts.append(f"catch {{reset_run {run_name}}}")
+        launch = f"launch_runs {run_name} -jobs {jobs}"
+        if to_step:
+            launch += f" -to_step {to_step}"
+        cmd_parts.append(launch)
+        # Immediately query status so the response can tell the caller what
+        # state the run is in right after launch (usually "Queued" or
+        # "Running synth_design").
+        cmd_parts.append(
+            f'puts stdout "LAUNCH_STATUS=[get_property STATUS [get_runs {run_name}]]"'
+        )
+        cmd_parts.append("flush stdout")
+
+        result = session.run_tcl("; ".join(cmd_parts), timeout_override=60)
+
+        # Parse the trailing status line
+        launch_status = ""
+        for line in result.output.splitlines():
+            if line.startswith("LAUNCH_STATUS="):
+                launch_status = line.split("=", 1)[1].strip()
+                break
+
+        return [TextContent(type="text", text=json.dumps({
+            "success": result.success,
+            "run": run_name,
+            "jobs": jobs,
+            "to_step": to_step or None,
+            "launch_status": launch_status,
+            "hint": "Call get_run_progress repeatedly (every 10-30s) to track progress without blocking.",
+            "output": result.output,
+            "elapsed_ms": result.elapsed_ms,
+        }, indent=2))]
+
+    elif name == "get_run_progress":
+        # Non-blocking progress query. Safe to call at any time; Vivado just
+        # reads the run object's properties without affecting the background
+        # subprocess doing the actual work.
+        run_name = arguments.get("run", "").strip()
+        if not run_name:
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "error": "Missing 'run' argument"
+            }, indent=2))]
+
+        info = verify_run_status(session, run_name)
+        status_lower = info.get("status", "").lower()
+        finished = (
+            info.get("actually_succeeded", False)
+            or info.get("actually_failed", False)
+            or status_lower.endswith("complete!")
+        )
+
+        return [TextContent(type="text", text=json.dumps({
+            "success": True,
+            "run": run_name,
+            "status": info.get("status"),
+            "progress": info.get("progress"),
+            "finished": finished,
+            "succeeded": info.get("actually_succeeded", False),
+            "failed": info.get("actually_failed", False),
         }, indent=2))]
 
     # =========================================================================
