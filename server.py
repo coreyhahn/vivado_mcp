@@ -843,6 +843,28 @@ async def list_tools() -> list[Tool]:
                 "required": []
             }
         ),
+        Tool(
+            name="get_drc_violations",
+            description="Run report_drc and return structured violations: rule ID, severity, message, and affected objects. Replaces grepping through the DRC report text.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "severity_filter": {
+                        "type": "string",
+                        "description": "Filter by severity. Comma-separated list of any of: 'error', 'critical_warning', 'warning', 'advisory', 'info'. Default 'all' returns everything."
+                    },
+                    "ruledecks": {
+                        "type": "string",
+                        "description": "Optional ruledeck name to restrict the check (e.g. 'default', 'methodology', 'timing'). Default runs the tool's standard DRC set."
+                    },
+                    "max_violations": {
+                        "type": "integer",
+                        "description": "Cap the number of violations returned (default 500). Prevents the response from exploding on designs with thousands of warnings."
+                    }
+                },
+                "required": []
+            }
+        ),
 
         # =====================================================================
         # DESIGN QUERY TOOLS
@@ -1706,6 +1728,127 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             parsed = {severity: filtered, "raw": parsed["raw"]}
         parsed["success"] = result.success
         return [TextContent(type="text", text=json.dumps(parsed, indent=2))]
+
+    elif name == "get_drc_violations":
+        # Run report_drc and return structured violations. Agents routinely
+        # grep through the DRC report text for specific rule IDs; this tool
+        # surfaces that data as JSON so it can be filtered and counted
+        # without parsing.
+        severity_filter = arguments.get("severity_filter", "all").lower().strip()
+        ruledecks = arguments.get("ruledecks", "").strip()
+        max_viol = int(arguments.get("max_violations", 500))
+
+        # Build the report_drc command. Using -name lets us reference the
+        # result set, but the violation objects live directly under
+        # get_drc_violations after report_drc runs.
+        drc_cmd_parts = ["catch {report_drc"]
+        if ruledecks:
+            drc_cmd_parts.append(f"-ruledecks {ruledecks}")
+        drc_cmd_parts.append("-quiet}")
+        drc_cmd = " ".join(drc_cmd_parts)
+
+        # After DRC runs, enumerate violation objects. Escape newlines and
+        # pipes in messages so we can safely parse on the Python side.
+        # drc_violation objects expose NAME (rule name), SEVERITY, DESCRIPTION
+        # (the free-form text), CHECK (check id), CLASS (ruledeck), and ID.
+        # Older docs and other Vivado object types use MESSAGE, but
+        # drc_violation uses DESCRIPTION.
+        probe = (
+            f"{drc_cmd}; "
+            "set __mcp_rows__ [list]; "
+            "foreach __mcp_v__ [get_drc_violations] { "
+            "  set __mcp_nm__ [get_property NAME $__mcp_v__]; "
+            "  set __mcp_sv__ [get_property SEVERITY $__mcp_v__]; "
+            "  set __mcp_msg__ [get_property DESCRIPTION $__mcp_v__]; "
+            "  set __mcp_rule__ \"\"; "
+            "  catch {set __mcp_rule__ [get_property CLASS $__mcp_v__]}; "
+            "  set __mcp_msg__ [string map {\"\\n\" {\\n} | {\\|}} $__mcp_msg__]; "
+            "  set __mcp_sv__ [string map {| {\\|}} $__mcp_sv__]; "
+            "  lappend __mcp_rows__ \"$__mcp_nm__|$__mcp_sv__|$__mcp_rule__|$__mcp_msg__\" "
+            "}; "
+            "puts stdout [join $__mcp_rows__ \"\\n\"]; "
+            "flush stdout"
+        )
+        result = session.run_tcl(probe, timeout_override=120)
+
+        if not result.success:
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "error": "DRC command failed — is a synthesized or opened design in memory?",
+                "output": result.output,
+                "elapsed_ms": result.elapsed_ms,
+            }, indent=2))]
+
+        violations = []
+        counts_by_severity = {}
+        allowed = None
+        if severity_filter != "all":
+            allowed = {s.strip() for s in severity_filter.split(",") if s.strip()}
+
+        def _norm_sev(sev: str) -> str:
+            return sev.lower().replace(" ", "_")
+
+        for line in result.output.splitlines():
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            # Rejoin escaped pipes before splitting
+            # The Tcl string map replaced real `|` with `\|`, so split on the
+            # literal `|` and then unescape each field.
+            raw_fields = line.split("|")
+            # The message may still contain \| markers from the escape — we
+            # splitted too eagerly. Fix: greedy rejoin on first three
+            # unescaped separators; everything else is the message.
+            # Walk the fields and merge any that ended with an odd number of
+            # backslashes (escape was trailing).
+            merged = []
+            buf = ""
+            for f in raw_fields:
+                if buf:
+                    buf = buf + "|" + f
+                else:
+                    buf = f
+                # Count trailing backslashes — odd means escaped pipe
+                trailing = len(buf) - len(buf.rstrip("\\"))
+                if trailing % 2 == 0:
+                    merged.append(buf)
+                    buf = ""
+            if buf:
+                merged.append(buf)
+            fields = merged
+
+            if len(fields) < 4:
+                continue
+            name_f, sev_f, rule_f = fields[0], fields[1], fields[2]
+            msg_f = "|".join(fields[3:])
+            # Unescape the \n, \| placeholders
+            msg_f = msg_f.replace("\\|", "|").replace("\\n", "\n")
+
+            norm_sev = _norm_sev(sev_f)
+            counts_by_severity[norm_sev] = counts_by_severity.get(norm_sev, 0) + 1
+
+            if allowed is not None and norm_sev not in allowed:
+                continue
+            if len(violations) >= max_viol:
+                continue
+
+            violations.append({
+                "rule": name_f,
+                "severity": sev_f,
+                "ruledeck": rule_f,
+                "message": msg_f,
+            })
+
+        return [TextContent(type="text", text=json.dumps({
+            "success": True,
+            "total_violations": sum(counts_by_severity.values()),
+            "by_severity": counts_by_severity,
+            "returned": len(violations),
+            "truncated": sum(counts_by_severity.values()) > len(violations) and allowed is None,
+            "severity_filter": severity_filter,
+            "violations": violations,
+            "elapsed_ms": result.elapsed_ms,
+        }, indent=2))]
 
     # =========================================================================
     # DESIGN QUERIES
