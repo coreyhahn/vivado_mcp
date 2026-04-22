@@ -47,6 +47,7 @@ License: MIT
 import json
 import os
 import re
+import socket
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +56,32 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from .vivado_session import get_session, VivadoSession
+
+
+def _hw_server_reachable(hw_server_url: str, timeout: float = 1.0) -> bool:
+    """Return True if hw_server is accepting TCP connections at the given URL.
+
+    Vivado's `connect_hw_server` blocks for ~30s trying to reach hw_server if
+    nothing is there, and that hang leaks into the persistent Tcl session —
+    subsequent commands queue behind it and appear to hang forever. A cheap
+    Python-side TCP check lets us bail out before the Vivado call and keep
+    the session clean.
+
+    Accepts URLs in either `TCP:host:port` or `host:port` form.
+    """
+    url = hw_server_url[4:] if hw_server_url.startswith("TCP:") else hw_server_url
+    if ":" not in url:
+        return False
+    host, _, port_s = url.rpartition(":")
+    try:
+        port = int(port_s)
+    except ValueError:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, socket.error):
+        return False
 
 
 # =============================================================================
@@ -719,6 +746,65 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="generate_bitstream",
             description="Generate bitstream for the implemented design",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ),
+
+        # =====================================================================
+        # HARDWARE MANAGER TOOLS
+        # =====================================================================
+        # These tools drive Vivado's hardware manager to program physical
+        # FPGAs over JTAG / USB. hw_server must be reachable (localhost:3121
+        # by default). On Linux, hw_server is usually installed with Vivado
+        # at <vivado>/bin/hw_server and can be launched with `hw_server`
+        # from the terminal if it's not already running.
+
+        Tool(
+            name="list_hw_targets",
+            description="Connect to hw_server and list physical JTAG targets + devices. Use this before programming to confirm the board is visible.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "hw_server_url": {
+                        "type": "string",
+                        "description": "hw_server URL (default: TCP:localhost:3121)"
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="program_device",
+            description="Program a .bit file onto a physical FPGA via hw_server. This is the last mile: bitstream -> silicon. Safer than raw TCL because it verifies the bitfile exists and runs the full open_hw_manager/connect/program flow in one shot.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "bitfile": {
+                        "type": "string",
+                        "description": "Absolute path to the .bit file to program"
+                    },
+                    "hw_server_url": {
+                        "type": "string",
+                        "description": "hw_server URL (default: TCP:localhost:3121)"
+                    },
+                    "target_index": {
+                        "type": "integer",
+                        "description": "Index into get_hw_targets if multiple are connected (default 0)"
+                    },
+                    "device_index": {
+                        "type": "integer",
+                        "description": "Index of device within the chosen target (default 0 — typically the FPGA; SoCs may have multiple devices on the scan chain)"
+                    }
+                },
+                "required": ["bitfile"]
+            }
+        ),
+        Tool(
+            name="close_hw_manager",
+            description="Close the Vivado hardware manager and disconnect from hw_server. Frees the JTAG cable for other tools.",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -1510,6 +1596,151 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "success": result.success,
             "output": result.output,
             "elapsed_ms": result.elapsed_ms
+        }, indent=2))]
+
+    # =========================================================================
+    # HARDWARE MANAGER
+    # =========================================================================
+
+    elif name == "list_hw_targets":
+        # Enumerate physical JTAG targets reachable via hw_server. This opens
+        # the hardware manager if it isn't already open and connects to the
+        # server URL. Safe to call multiple times — Vivado is idempotent here.
+        hw_url = arguments.get("hw_server_url", "TCP:localhost:3121")
+
+        # Bail fast if hw_server isn't reachable — Vivado's connect_hw_server
+        # will otherwise hang the entire Tcl session for ~30s and poison
+        # subsequent commands.
+        if not _hw_server_reachable(hw_url):
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "hw_server_url": hw_url,
+                "error": "hw_server not reachable",
+                "hint": "Start hw_server (`<vivado>/bin/hw_server &`) and verify a JTAG cable is connected.",
+                "targets_found": 0,
+                "targets": [],
+            }, indent=2))]
+
+        # Run open + connect defensively. If hw_manager is already open or the
+        # connection already exists, Vivado prints a warning but keeps going.
+        # Wrap each step in catch so one prior state doesn't abort the whole
+        # query.
+        probe = (
+            "catch {open_hw_manager}; "
+            f"catch {{connect_hw_server -url {hw_url}}}; "
+            "set __mcp_rows__ [list]; "
+            "foreach __mcp_t__ [get_hw_targets] { "
+            "  set __mcp_devs__ [list]; "
+            "  catch {current_hw_target $__mcp_t__; open_hw_target -quiet}; "
+            "  foreach __mcp_d__ [get_hw_devices] { "
+            "    lappend __mcp_devs__ \"[get_property PART $__mcp_d__]\""
+            "  }; "
+            "  lappend __mcp_rows__ \"$__mcp_t__||[join $__mcp_devs__ ,]\" "
+            "}; "
+            "puts stdout [join $__mcp_rows__ \"\\n\"]; "
+            "flush stdout"
+        )
+        result = session.run_tcl(probe, timeout_override=30)
+
+        targets = []
+        if result.success and result.output.strip():
+            for line in result.output.splitlines():
+                line = line.strip()
+                if "||" not in line:
+                    continue
+                tname, devs = line.split("||", 1)
+                targets.append({
+                    "target": tname,
+                    "devices": [d for d in devs.split(",") if d],
+                })
+
+        return [TextContent(type="text", text=json.dumps({
+            "success": result.success,
+            "hw_server_url": hw_url,
+            "targets_found": len(targets),
+            "targets": targets,
+            "raw": result.output if not targets else None,
+            "elapsed_ms": result.elapsed_ms,
+        }, indent=2))]
+
+    elif name == "program_device":
+        # Program a .bit file onto a physical FPGA. This is the terminal
+        # step that takes a verified bitstream and puts it on silicon. We
+        # verify the file exists up front so the agent doesn't spend 5s in
+        # Vivado only to get "file not found" at the last step.
+        import os
+
+        bitfile = arguments.get("bitfile", "")
+        if not bitfile or not os.path.isfile(bitfile):
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "error": f"Bitfile not found: {bitfile}",
+                "hint": "Pass an absolute path to an existing .bit file."
+            }, indent=2))]
+
+        hw_url = arguments.get("hw_server_url", "TCP:localhost:3121")
+        target_idx = int(arguments.get("target_index", 0))
+        device_idx = int(arguments.get("device_index", 0))
+
+        # Fail fast if hw_server isn't accepting connections. Without this
+        # check Vivado's connect_hw_server hangs the session for ~30s and
+        # poisons follow-up commands.
+        if not _hw_server_reachable(hw_url):
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "bitfile": bitfile,
+                "hw_server_url": hw_url,
+                "error": "hw_server not reachable",
+                "hint": "Start hw_server (`<vivado>/bin/hw_server &`) and verify a JTAG cable is connected.",
+            }, indent=2))]
+
+        # Run the whole program flow in one TCL shot so any intermediate
+        # failure (cable disconnected, multiple boards, wrong device) is
+        # caught by a single round-trip. Uses catch to capture the error
+        # message but still report structured output.
+        flow = (
+            "catch {open_hw_manager}; "
+            f"catch {{connect_hw_server -url {hw_url}}}; "
+            "set __mcp_err__ \"\"; "
+            "if {[catch { "
+            f"  set __mcp_tgts__ [get_hw_targets]; "
+            f"  if {{[llength $__mcp_tgts__] == 0}} {{error \"no hw_targets visible — is the cable connected and hw_server running?\"}}; "
+            f"  current_hw_target [lindex $__mcp_tgts__ {target_idx}]; "
+            "  catch {open_hw_target}; "
+            f"  set __mcp_devs__ [get_hw_devices]; "
+            f"  if {{[llength $__mcp_devs__] == 0}} {{error \"no hw_devices on target\"}}; "
+            f"  set __mcp_dev__ [lindex $__mcp_devs__ {device_idx}]; "
+            f"  current_hw_device $__mcp_dev__; "
+            f"  set_property PROGRAM.FILE {{{bitfile}}} $__mcp_dev__; "
+            "  program_hw_devices $__mcp_dev__; "
+            "  refresh_hw_device $__mcp_dev__; "
+            "  puts stdout \"PROGRAMMED $__mcp_dev__\"; "
+            "  flush stdout "
+            "} __mcp_err__]} { "
+            "  puts stdout \"FAILED: $__mcp_err__\"; flush stdout "
+            "}"
+        )
+        result = session.run_tcl(flow, timeout_override=120)
+
+        programmed = "PROGRAMMED" in result.output and "FAILED" not in result.output
+        return [TextContent(type="text", text=json.dumps({
+            "success": programmed,
+            "bitfile": bitfile,
+            "hw_server_url": hw_url,
+            "target_index": target_idx,
+            "device_index": device_idx,
+            "output": result.output,
+            "elapsed_ms": result.elapsed_ms,
+        }, indent=2))]
+
+    elif name == "close_hw_manager":
+        # Release the JTAG cable and close the hardware manager so other
+        # tools (e.g. openocd, openFPGALoader, a second Vivado) can use it.
+        result = session.run_tcl("catch {close_hw_target}; catch {disconnect_hw_server}; catch {close_hw_manager}; puts stdout CLOSED; flush stdout")
+        return [TextContent(type="text", text=json.dumps({
+            "success": "CLOSED" in result.output,
+            "output": result.output,
+            "elapsed_ms": result.elapsed_ms,
         }, indent=2))]
 
     # =========================================================================
