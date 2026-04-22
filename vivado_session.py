@@ -50,6 +50,7 @@ License: MIT
 import pexpect
 import time
 import re
+import uuid
 from typing import Optional
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -420,46 +421,84 @@ class VivadoSession:
                 except (pexpect.TIMEOUT, pexpect.EOF):
                     pass  # Expected - buffer was empty
 
-                # Send the command to Vivado
+                # Bracket the command with unique sentinel markers so we can
+                # reliably extract output regardless of command length or
+                # whether Vivado wraps the command echo across lines.
+                #
+                # Each marker is sent as its own sendline so a failure in the
+                # user's command doesn't skip the end marker (Tcl aborts a
+                # compound "a; b; c" at the first error, but separate sendlines
+                # are independent statements, each printing Vivado%'s own
+                # prompt afterwards). Using UUIDs makes collisions with actual
+                # output astronomically unlikely.
+                tag = uuid.uuid4().hex[:12]
+                marker_begin = f"__MCP_BEGIN_{tag}__"
+                marker_end = f"__MCP_END_{tag}__"
+
+                self.child.sendline(f'puts stdout "{marker_begin}"; flush stdout')
                 self.child.sendline(command)
+                self.child.sendline(f'puts stdout "{marker_end}"; flush stdout')
 
-                # Wait for the Vivado prompt indicating command completion
-                # The prompt appears after Vivado finishes processing
-                # Use timeout_override if provided (for long operations like synthesis)
+                # Wait for the end marker to appear. We anchor on the marker
+                # followed by a newline so pexpect matches the real stdout
+                # print (marker + \n), not the echoed command line (which has
+                # trailing `"; flush stdout`). Use timeout_override for long
+                # operations like synthesis or impl.
                 effective_timeout = timeout_override if timeout_override is not None else self.timeout
-                self.child.expect('Vivado%', timeout=effective_timeout)
+                self.child.expect(re.escape(marker_end) + r"\s*\r?\n", timeout=effective_timeout)
 
-                # Get everything that was output before the prompt
+                # child.before now contains everything between the send of the
+                # first marker line and the arrival of the end marker. Extract
+                # the region strictly between the two markers.
                 raw_output = self.child.before
 
-                # Parse the output to extract meaningful content
-                # Raw output includes: command echo, actual output, whitespace
-                lines = raw_output.replace('\r', '').split('\n')
-                clean_lines = []
-                found_command = False
+                # The marker appears twice in the buffer: once as the echoed
+                # `puts stdout "marker"` command, once as the actual stdout
+                # line. We want the region after the SECOND occurrence — the
+                # real print — so find the first, then find the next one
+                # after that.
+                first = raw_output.find(marker_begin)
+                second = raw_output.find(marker_begin, first + 1) if first != -1 else -1
+                if second != -1:
+                    region = raw_output[second + len(marker_begin):]
+                elif first != -1:
+                    # Fallback: only one occurrence seen (shouldn't happen,
+                    # but be safe)
+                    region = raw_output[first + len(marker_begin):]
+                else:
+                    region = raw_output
 
-                # Normalize command for matching (handle whitespace differences)
-                cmd_normalized = command.strip()
+                # Clean up: drop prompt lines, command echoes, blank lines.
+                # We keep all real stdout between the markers.
+                lines = region.replace('\r', '').split('\n')
+                clean_lines = []
+                cmd_stripped = command.strip()
+                begin_cmd = f'puts stdout "{marker_begin}"'
+                end_cmd = f'puts stdout "{marker_end}"'
 
                 for line in lines:
                     stripped = line.strip()
-
-                    # Skip lines until we find the echoed command
-                    # Everything before is leftover from previous operations
-                    if not found_command:
-                        if cmd_normalized in stripped:
-                            found_command = True
-                        continue
-
-                    # Skip Vivado prompts in output
-                    if stripped == 'Vivado%' or stripped.startswith('Vivado%'):
-                        continue
-
-                    # Skip empty lines for cleaner output
                     if not stripped:
                         continue
-
+                    # Drop Vivado prompts
+                    if stripped == 'Vivado%' or stripped.startswith('Vivado%'):
+                        continue
+                    # Drop echo of marker commands (Vivado echoes each sendline)
+                    if begin_cmd in stripped or end_cmd in stripped:
+                        continue
+                    # Drop echo of the user's command itself
+                    if stripped == cmd_stripped:
+                        continue
+                    # Also drop Vivado's own command-completion line (empty)
                     clean_lines.append(stripped)
+
+                # After the end marker we may have absorbed a trailing prompt —
+                # swallow the rest of the buffer up to the next Vivado% so the
+                # next run_tcl call starts clean.
+                try:
+                    self.child.expect('Vivado%', timeout=2)
+                except (pexpect.TIMEOUT, pexpect.EOF):
+                    pass
 
                 output = '\n'.join(clean_lines).strip()
 
