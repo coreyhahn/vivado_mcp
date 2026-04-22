@@ -912,6 +912,28 @@ async def list_tools() -> list[Tool]:
                 "required": []
             }
         ),
+        Tool(
+            name="check_constraints",
+            description="Audit every top-level port for PACKAGE_PIN and IOSTANDARD assignments. Reports which ports are unconstrained — the condition that triggers UCIO-1 DRC and produces broken bitstreams when DRC is downgraded. Optionally generate a ready-to-edit XDC skeleton for the missing ports.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "generate_skeleton": {
+                        "type": "boolean",
+                        "description": "If true, include an XDC skeleton (as a string) for every unconstrained port. Defaults to false."
+                    },
+                    "skeleton_iostandard": {
+                        "type": "string",
+                        "description": "IOSTANDARD placeholder to emit in the skeleton (default 'LVCMOS18'). Users must still verify this matches their board's bank voltage."
+                    },
+                    "output_file": {
+                        "type": "string",
+                        "description": "Optional path. If set and generate_skeleton is true, the skeleton is also written to this file."
+                    }
+                },
+                "required": []
+            }
+        ),
 
         # =====================================================================
         # RAW TCL TOOL
@@ -1802,6 +1824,131 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "success": result.success,
             "cells": result.output.split() if result.success else [],
             "elapsed_ms": result.elapsed_ms
+        }, indent=2))]
+
+    elif name == "check_constraints":
+        # Audit every top-level port for physical pin + iostandard constraints.
+        # This is the gap that UCIO-1 DRC is supposed to close; agents often
+        # downgrade UCIO-1 to warning and ship bitstreams with floating IOs,
+        # which produces random pin mappings on real silicon. We emit a
+        # structured report so the agent can tell the user "N ports are
+        # unconstrained" without waiting for the DRC stage.
+        generate_skeleton = arguments.get("generate_skeleton", False)
+        iostd_default = arguments.get("skeleton_iostandard", "LVCMOS18")
+        output_file = arguments.get("output_file")
+
+        # Collect port metadata in one TCL round-trip. Use a pipe-separated
+        # format so Python can split reliably even on bus ports like
+        # "stimulus_N[0]" whose names contain brackets.
+        #
+        # IS_LOC_FIXED is the authoritative signal for "user XDC set this
+        # pin". After place_design, the placer fills PACKAGE_PIN even for
+        # unconstrained ports, so reading PACKAGE_PIN alone would give a
+        # false positive. IS_LOC_FIXED is 1 iff the user specified LOC.
+        # IOSTANDARD defaults to "DEFAULT" when unspecified — we treat that
+        # literal as missing.
+        probe = (
+            "set __mcp_lines__ [list]; "
+            "foreach __mcp_p__ [get_ports *] { "
+            "  set __mcp_loc_fixed__ 0; "
+            "  catch {set __mcp_loc_fixed__ [get_property IS_LOC_FIXED $__mcp_p__]}; "
+            "  lappend __mcp_lines__ \"$__mcp_p__|"
+            "[get_property DIRECTION $__mcp_p__]|"
+            "[get_property PACKAGE_PIN $__mcp_p__]|"
+            "[get_property IOSTANDARD $__mcp_p__]|"
+            "$__mcp_loc_fixed__\""
+            "}; "
+            "puts stdout [join $__mcp_lines__ \"\\n\"]; "
+            "flush stdout"
+        )
+        result = session.run_tcl(probe)
+        if not result.success:
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "error": "Failed to query ports — is a design open?",
+                "output": result.output,
+                "elapsed_ms": result.elapsed_ms
+            }, indent=2))]
+
+        # Parse the pipe-separated rows back into structured port records.
+        # A port counts as user-constrained only if the LOC was fixed by
+        # the user (IS_LOC_FIXED=1) AND the IOSTANDARD is a real value (not
+        # empty, not the placeholder 'DEFAULT').
+        ports = []
+        unconstrained = []
+        for line in result.output.splitlines():
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            parts = line.split("|")
+            if len(parts) < 5:
+                continue
+            port_name, direction, package_pin, iostandard, loc_fixed_s = (
+                parts[0], parts[1], parts[2], parts[3], parts[4]
+            )
+            loc_user_set = loc_fixed_s.strip() in ("1", "true", "TRUE", "yes")
+            iostd_real = bool(iostandard.strip()) and iostandard.strip().upper() != "DEFAULT"
+            pin_present = bool(package_pin.strip())
+
+            record = {
+                "port": port_name,
+                "direction": direction,
+                "package_pin": package_pin,
+                "iostandard": iostandard,
+                "loc_user_set": loc_user_set,
+                "pin_assigned_by_placer": pin_present and not loc_user_set,
+                "constrained": loc_user_set and iostd_real,
+            }
+            ports.append(record)
+            if not record["constrained"]:
+                missing = []
+                if not loc_user_set:
+                    missing.append("PACKAGE_PIN")
+                if not iostd_real:
+                    missing.append("IOSTANDARD")
+                record["missing"] = missing
+                unconstrained.append(record)
+
+        # Build XDC skeleton if requested. One block per unconstrained port,
+        # with a placeholder pin so synth can flag missed edits, and a
+        # user-selectable IOSTANDARD default.
+        skeleton = None
+        if generate_skeleton and unconstrained:
+            lines_out = [
+                "# XDC skeleton generated by vivado-mcp check_constraints",
+                "# Fill in <PIN> values for your target board before synthesis.",
+                "# Verify IOSTANDARD matches the bank voltage of each pin.",
+                "",
+            ]
+            for rec in unconstrained:
+                lines_out.append(f"# Port: {rec['port']}  ({rec['direction']})")
+                if "PACKAGE_PIN" in rec.get("missing", []):
+                    lines_out.append(
+                        f"set_property PACKAGE_PIN <PIN> [get_ports {{{rec['port']}}}]"
+                    )
+                if "IOSTANDARD" in rec.get("missing", []):
+                    lines_out.append(
+                        f"set_property IOSTANDARD {iostd_default} "
+                        f"[get_ports {{{rec['port']}}}]"
+                    )
+                lines_out.append("")
+            skeleton = "\n".join(lines_out)
+            if output_file:
+                try:
+                    with open(output_file, "w") as fh:
+                        fh.write(skeleton)
+                except OSError as exc:
+                    skeleton = f"# Failed to write {output_file}: {exc}\n\n" + skeleton
+
+        return [TextContent(type="text", text=json.dumps({
+            "success": True,
+            "total_ports": len(ports),
+            "constrained": len(ports) - len(unconstrained),
+            "unconstrained": len(unconstrained),
+            "unconstrained_ports": unconstrained,
+            "skeleton": skeleton,
+            "output_file": output_file if (skeleton and output_file) else None,
+            "elapsed_ms": result.elapsed_ms,
         }, indent=2))]
 
     # =========================================================================
