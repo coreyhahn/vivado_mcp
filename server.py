@@ -1840,13 +1840,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # Collect port metadata in one TCL round-trip. Use a pipe-separated
         # format so Python can split reliably even on bus ports like
         # "stimulus_N[0]" whose names contain brackets.
+        #
+        # IS_LOC_FIXED is the authoritative signal for "user XDC set this
+        # pin". After place_design, the placer fills PACKAGE_PIN even for
+        # unconstrained ports, so reading PACKAGE_PIN alone would give a
+        # false positive. IS_LOC_FIXED is 1 iff the user specified LOC.
+        # IOSTANDARD defaults to "DEFAULT" when unspecified — we treat that
+        # literal as missing.
         probe = (
             "set __mcp_lines__ [list]; "
             "foreach __mcp_p__ [get_ports *] { "
+            "  set __mcp_loc_fixed__ 0; "
+            "  catch {set __mcp_loc_fixed__ [get_property IS_LOC_FIXED $__mcp_p__]}; "
             "  lappend __mcp_lines__ \"$__mcp_p__|"
             "[get_property DIRECTION $__mcp_p__]|"
             "[get_property PACKAGE_PIN $__mcp_p__]|"
-            "[get_property IOSTANDARD $__mcp_p__]\""
+            "[get_property IOSTANDARD $__mcp_p__]|"
+            "$__mcp_loc_fixed__\""
             "}; "
             "puts stdout [join $__mcp_lines__ \"\\n\"]; "
             "flush stdout"
@@ -1861,6 +1871,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         # Parse the pipe-separated rows back into structured port records.
+        # A port counts as user-constrained only if the LOC was fixed by
+        # the user (IS_LOC_FIXED=1) AND the IOSTANDARD is a real value (not
+        # empty, not the placeholder 'DEFAULT').
         ports = []
         unconstrained = []
         for line in result.output.splitlines():
@@ -1868,26 +1881,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if not line or "|" not in line:
                 continue
             parts = line.split("|")
-            if len(parts) < 4:
+            if len(parts) < 5:
                 continue
-            port_name, direction, package_pin, iostandard = (
-                parts[0], parts[1], parts[2], "|".join(parts[3:])
+            port_name, direction, package_pin, iostandard, loc_fixed_s = (
+                parts[0], parts[1], parts[2], parts[3], parts[4]
             )
-            has_pin = bool(package_pin.strip())
-            has_iostd = bool(iostandard.strip())
+            loc_user_set = loc_fixed_s.strip() in ("1", "true", "TRUE", "yes")
+            iostd_real = bool(iostandard.strip()) and iostandard.strip().upper() != "DEFAULT"
+            pin_present = bool(package_pin.strip())
+
             record = {
                 "port": port_name,
                 "direction": direction,
                 "package_pin": package_pin,
                 "iostandard": iostandard,
-                "constrained": has_pin and has_iostd,
+                "loc_user_set": loc_user_set,
+                "pin_assigned_by_placer": pin_present and not loc_user_set,
+                "constrained": loc_user_set and iostd_real,
             }
             ports.append(record)
-            if not (has_pin and has_iostd):
+            if not record["constrained"]:
                 missing = []
-                if not has_pin:
+                if not loc_user_set:
                     missing.append("PACKAGE_PIN")
-                if not has_iostd:
+                if not iostd_real:
                     missing.append("IOSTANDARD")
                 record["missing"] = missing
                 unconstrained.append(record)
